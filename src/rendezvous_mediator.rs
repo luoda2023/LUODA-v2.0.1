@@ -98,7 +98,21 @@ impl RendezvousMediator {
         #[cfg(target_os = "android")]
         let start_lan_listening = true;
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        let start_lan_listening = crate::platform::is_installed();
+        // LUODA: 便携 / 免安装运行时同样必须启动 LAN 发现监听。
+        //
+        // 上游用 `is_installed()`（注册表 InstallLocation 指向的 exe 是否存在）
+        // 作闸门，结果是「绿色版 / 免安装运行」永远不绑 21119。可用 `netstat`
+        // 直接验证：进程只有 21118 / 50116，没有 21119。
+        //
+        // 后果是**同网段设备发来的 ping 无人应答**，对方拿不到本机局域网地址，
+        // 只能回落信令链路；而手机端经 WebSocket 注册后端口被写死为 0，TCP
+        // 打洞在协议层就不可用。于是「手机连 PC」的三条直连路径
+        // （显式 IP / LAN 缓存 / 连接前补发现）全部落空，必然失败 ——
+        // 这是华为 / OPPO 连不上 PC 的根因。
+        //
+        // LAN 发现是纯功能能力，与安装形态无关。多实例争抢同一端口由
+        // `start_listening` 内的绑定重试 + `allow_err!` 兜底，不会崩。
+        let start_lan_listening = true;
         if start_lan_listening {
             std::thread::spawn(move || {
                 allow_err!(super::lan::start_listening());

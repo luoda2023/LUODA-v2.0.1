@@ -104,12 +104,174 @@ pub(super) fn start_listening() -> ResultType<()> {
 /// 多网卡 / 广播重传的情况。
 pub(crate) const DISCOVER_WINDOW: Duration = Duration::from_secs(3);
 
-/// 不依赖 `#[tokio::main]` 宏的发现实现，可以在任意 async 上下文里直接
-/// `await`（例如 `client::Client::_start` 在连接前补一轮发现）。
+/// 单播扫描的每网段主机数上限（/24 全扫 = 254 个）。
+///
+/// 比 /24 更宽的网段（/16 等）也一律按 /24 收敛：家用 / 办公环境里被控端
+/// 基本都和自己落在同一个 /24，扫满 6 万多个地址既慢又会打爆内核邻居表。
+const SWEEP_HOST_LIMIT: usize = 254;
+
+/// 单播扫描的限频间隔。周期性发现每轮都扫一遍会给局域网制造**持续**流量
+/// （每个网段 254 个包），所以周期性那一侧最多 45s 扫一次。
+/// 连接前的补发现不受此限——那次如果扫不到，这次连接就一定失败。
+const SWEEP_MIN_INTERVAL: Duration = Duration::from_secs(45);
+
+/// 与 `direct_access::lan_candidate_score` 保持同一份名单：这些网卡是
+/// VPN / 虚拟机 / 隧道，扫它们的网段既找不到被控端也白费流量。
+const VIRTUAL_IFACE_MARKERS: [&str; 21] = [
+    "virtual",
+    "vethernet",
+    "vmware",
+    "virtualbox",
+    "vbox",
+    "hyper-v",
+    "hyperv",
+    "wsl",
+    "docker",
+    "tailscale",
+    "wireguard",
+    "vpn",
+    "tunnel",
+    "loopback",
+    "bluetooth",
+    "pseudo",
+    "tun",
+    "tap",
+    "ppp",
+    "isatap",
+    "teredo",
+];
+
+/// 构造局域网发现的 ping 报文。
+///
+/// 移动端必须带上自己的 ID：手机拿不到 MAC 地址，`start_listening` 里靠
+/// `p.id == self_id` 排除自己，否则会把自己"发现"一次。
+fn build_ping_packet() -> ResultType<Vec<u8>> {
+    let mut msg_out = Message::new();
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let id = crate::ui_interface::get_id();
+    // `crate::ui_interface::get_id()` will cause error:
+    // `get_id()` uses async code with `current_thread`, which is not allowed in this context.
+    //
+    // No need to get id for desktop platforms.
+    // We can use the mac address to identify the device.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let id = "".to_owned();
+    let peer = PeerDiscovery {
+        cmd: "ping".to_owned(),
+        id,
+        ..Default::default()
+    };
+    msg_out.set_peer_discovery(peer);
+    Ok(msg_out.write_to_bytes()?)
+}
+
+/// 生成本地各私有网段的「单播扫描计划」：`(本网卡地址, 该网段内待探测的主机)`。
+///
+/// 配对返回而不是摊平成一个地址列表：`send_to` 必须走绑定在该网卡上的
+/// socket，否则多网卡机器会把 A 网段的包从 B 网卡（默认路由）发出去。
+fn unicast_sweep_plan() -> Vec<(Ipv4Addr, Vec<Ipv4Addr>)> {
+    // iOS 上 `default_net::get_interfaces()` 会引发 undefined symbol（见
+    // `create_broadcast_sockets` 里的说明），所以整个枚举块被 cfg 掉，
+    // 此时 `plan` 不需要 mut。
+    #[allow(unused_mut)]
+    let mut plan: Vec<(Ipv4Addr, Vec<Ipv4Addr>)> = Vec::new();
+
+    #[cfg(not(target_os = "ios"))]
+    for interface in default_net::get_interfaces() {
+        let name = interface.name.to_ascii_lowercase();
+        if VIRTUAL_IFACE_MARKERS.iter().any(|marker| name.contains(marker)) {
+            continue;
+        }
+        for ipv4 in &interface.ipv4 {
+            let host = ipv4.addr;
+            // 只扫私有地址段：公网网段扫一遍既无意义，还可能被当成扫描行为。
+            if !host.is_private() {
+                continue;
+            }
+            // 收敛到 /24：比 /24 宽的按 /24 裁剪，比 /24 窄的按实际范围来。
+            let prefix = u32::from(ipv4.prefix_len.clamp(24, 30));
+            let mask = (!0u32) << (32 - prefix);
+            let network = u32::from(host) & mask;
+            let broadcast = network | !mask;
+
+            let mut targets = Vec::new();
+            let mut cur = network.saturating_add(1);
+            while cur < broadcast && targets.len() < SWEEP_HOST_LIMIT {
+                let candidate = Ipv4Addr::from(cur);
+                if candidate != host {
+                    targets.push(candidate);
+                }
+                cur = cur.saturating_add(1);
+            }
+            if !targets.is_empty() {
+                plan.push((host, targets));
+            }
+        }
+    }
+
+    plan
+}
+
+/// 周期性发现那一侧的单播扫描限频。见 `SWEEP_MIN_INTERVAL`。
+fn sweep_due() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_SWEEP_UNIX: AtomicU64 = AtomicU64::new(0);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_SWEEP_UNIX.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < SWEEP_MIN_INTERVAL.as_secs() {
+        return false;
+    }
+    LAST_SWEEP_UNIX.store(now, Ordering::Relaxed);
+    true
+}
+
+/// 一轮发现：先发广播，可选地再对每个本地私有网段发一批单播探测包，
+/// 然后共用一个接收窗口收 pong。
 ///
 /// `overall` 是硬上界：收包的阻塞 socket 跑在独立线程里，调用方不会被拖住。
-pub async fn discover_impl_within(overall: Duration) -> ResultType<()> {
-    let sockets = send_query()?;
+async fn discover_within(overall: Duration, unicast_sweep: bool) -> ResultType<()> {
+    let mut sockets = create_broadcast_sockets();
+    if sockets.is_empty() {
+        bail!("Found no bindable ipv4 addresses");
+    }
+    let out = build_ping_packet()?;
+    let port = get_broadcast_port();
+
+    let maddr = SocketAddr::from(([255, 255, 255, 255], port));
+    for socket in &sockets {
+        allow_err!(socket.send_to(&out, maddr));
+    }
+
+    // 单播兜底。见 `unicast_sweep_plan` 与 `client::Client::_start` 的说明：
+    // 华为 / 荣耀等 ROM 会在后台把**非单播**报文直接从 Wi-Fi 驱动层丢掉，
+    // 这类设备永远不回广播，但对单播 100% 响应。扫描发送是同步非阻塞的，
+    // 和广播共用同一个接收窗口，所以不额外增加连接等待时间。
+    let mut swept = 0usize;
+    if unicast_sweep {
+        for (local, targets) in unicast_sweep_plan() {
+            let Ok(socket) = UdpSocket::bind(SocketAddr::from((local, 0))) else {
+                log::warn!("unicast sweep: bind {local} failed, skip this subnet");
+                continue;
+            };
+            for ip in &targets {
+                if socket.send_to(&out, SocketAddr::from((*ip, port))).is_ok() {
+                    swept += 1;
+                }
+            }
+            sockets.push(socket);
+        }
+    }
+
+    if swept > 0 {
+        log::info!("discover ping sent (broadcast + {swept} unicast datagrams)");
+    } else {
+        log::info!("discover ping sent");
+    }
+
     let rx = spawn_wait_responses(sockets, overall);
     // 只有跑满完整窗口的那一轮才把没回应的设备标记为离线。连接前补的那一轮
     // 窗口很短（1.5s），如果也去清 online 标记，会把本来在线的设备误标成离线，
@@ -118,6 +280,27 @@ pub async fn discover_impl_within(overall: Duration) -> ResultType<()> {
 
     log::info!("discover ping done");
     Ok(())
+}
+
+/// 不依赖 `#[tokio::main]` 宏的发现实现，可以在任意 async 上下文里直接
+/// `await`（例如 `client::Client::_start` 在连接前补一轮发现）。
+///
+/// 周期性发现：单播扫描按 `SWEEP_MIN_INTERVAL` 限频，避免持续制造扫描流量。
+pub async fn discover_impl_within(overall: Duration) -> ResultType<()> {
+    discover_within(overall, sweep_due()).await
+}
+
+/// 连接前补一轮发现：**广播 + 单播扫描同时发出**，共用一个接收窗口。
+///
+/// 与 `discover_impl_within` 分开的原因是调用方的语义不同：这里是"马上要连
+/// 某个 ID，必须尽力找到它"，所以单播扫描不限频——上一条 `lan_peer_hosts`
+/// 没命中时才走到这里，扫不到就真的连不上了。
+///
+/// 合并成一轮而不是"广播超时后再扫"是为了不让连接多等一整个窗口：
+/// 「广播聋」设备（见 `unicast_sweep_plan`）在广播轮里必然是空手而归的，
+/// 串行两轮就是 2 倍延迟。
+pub async fn discover_lan_first_within(overall: Duration) -> ResultType<()> {
+    discover_within(overall, true).await
 }
 
 pub async fn discover_impl() -> ResultType<()> {
@@ -229,39 +412,6 @@ fn create_broadcast_sockets() -> Vec<UdpSocket> {
         }
     }
     sockets
-}
-
-fn send_query() -> ResultType<Vec<UdpSocket>> {
-    let sockets = create_broadcast_sockets();
-    if sockets.is_empty() {
-        bail!("Found no bindable ipv4 addresses");
-    }
-
-    let mut msg_out = Message::new();
-    // We may not be able to get the mac address on mobile platforms.
-    // So we need to use the id to avoid discovering ourselves.
-    #[cfg(any(target_os = "android", target_os = "ios"))]
-    let id = crate::ui_interface::get_id();
-    // `crate::ui_interface::get_id()` will cause error:
-    // `get_id()` uses async code with `current_thread`, which is not allowed in this context.
-    //
-    // No need to get id for desktop platforms.
-    // We can use the mac address to identify the device.
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    let id = "".to_owned();
-    let peer = PeerDiscovery {
-        cmd: "ping".to_owned(),
-        id,
-        ..Default::default()
-    };
-    msg_out.set_peer_discovery(peer);
-    let out = msg_out.write_to_bytes()?;
-    let maddr = SocketAddr::from(([255, 255, 255, 255], get_broadcast_port()));
-    for socket in &sockets {
-        allow_err!(socket.send_to(&out, maddr));
-    }
-    log::info!("discover ping sent");
-    Ok(sockets)
 }
 
 fn wait_response(

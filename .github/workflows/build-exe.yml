@@ -147,16 +147,32 @@ jobs:
           flutter clean
           flutter build windows --release
       - name: Sign executable with LDesk icon
+        # 图标是纯装饰。这一步曾因 `rcedit` 不在 PATH（choco 装完 shim 未刷新到已
+        # 初始化的 bash 环境）报 exit 127，而 x64 分支又没有 `|| true`，直接让
+        # 整个 2.2.33 发布构建挂掉（run #960，steps 18）。现在两步加固：
+        #   1. 显式把 chocolatey 的 bin 加进 PATH；
+        #   2. 无论 rcedit 是否可用，这一步都返回 0，绝不阻断产物上传。
         shell: bash
         run: |
-          choco install rcedit -y
+          set +e
+          export PATH="$PATH:/c/ProgramData/chocolatey/bin"
+          if ! command -v rcedit >/dev/null 2>&1; then
+            choco install rcedit -y >/dev/null 2>&1
+            export PATH="$PATH:/c/ProgramData/chocolatey/bin"
+          fi
+          if ! command -v rcedit >/dev/null 2>&1; then
+            echo "::warning::rcedit 不可用，保留默认图标（不阻断构建）"
+            exit 0
+          fi
           if [ "${{ matrix.arch }}" = "x86" ]; then
             rcedit "target/i686-pc-windows-msvc/release/luoda.dll" --set-icon "res/icon.ico" || true
             rcedit "target/i686-pc-windows-msvc/release/service.exe" --set-icon "res/icon.ico" || true
             rcedit "target/i686-pc-windows-msvc/release/naming.exe" --set-icon "res/icon.ico" || true
           else
-            rcedit "flutter/build/windows/x64/runner/Release/LDesk.exe" --set-icon "res/icon.ico"
+            rcedit "flutter/build/windows/x64/runner/Release/LDesk.exe" --set-icon "res/icon.ico" \
+              || echo "::warning::rcedit 设置图标失败，保留默认图标"
           fi
+          exit 0
       - name: Build portable packer
         timeout-minutes: 15
         shell: bash

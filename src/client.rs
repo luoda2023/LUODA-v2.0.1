@@ -283,9 +283,16 @@ impl Client {
             let mut lan_hosts =
                 crate::direct_access::lan_peer_hosts(peer, DEFAULT_DIRECT_PORT as u16);
             if lan_hosts.is_empty() {
-                // 缓存里没有这个 ID —— 连接前现场补一轮广播发现（硬上界 1.5s）。
+                // 缓存里没有这个 ID —— 连接前现场补一轮发现（硬上界 1.5s）：
+                // 广播 + 单播网段扫描同时发出，共用一个接收窗口。
+                //
+                // 必须带单播那一轮：华为 / 荣耀等 ROM 在后台会把**非单播**报文
+                // 直接从 Wi-Fi 驱动层丢掉（实测广播 0/6 无响应、单播 100% 回
+                // pong），只发广播的话这类设备永远发现不了，只能回落信令链路，
+                // 而手机端经 WebSocket 注册后端口被写死为 0，打洞必然失败。
                 // 不在同一局域网时空手而归，之后照常走信令链路，不受影响。
-                match crate::lan::discover_impl_within(std::time::Duration::from_millis(1500)).await
+                match crate::lan::discover_lan_first_within(std::time::Duration::from_millis(1500))
+                    .await
                 {
                     Ok(_) => {
                         lan_hosts =
