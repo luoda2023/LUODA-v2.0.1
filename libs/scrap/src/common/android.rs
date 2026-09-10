@@ -95,7 +95,17 @@ impl<'a> crate::TraitPixelBuffer for PixelBuffer<'a> {
     }
 
     fn pixfmt(&self) -> Pixfmt {
-        Pixfmt::BGRA // Android ImageReader RGBA_8888 is actually BGRA in memory
+        // ImageReader is created with PixelFormat.RGBA_8888, and Android stores
+        // that buffer as R,G,B,A in memory (AHardwareBuffer
+        // R8G8B8A8_UNORM: "in memory layout, R is at the lowest address").
+        // libyuv names this layout ABGR, so Pixfmt::RGBA -> ABGRToI420 is the
+        // correct pairing in convert.rs.
+        //
+        // Declaring BGRA here (as this fork did until v2.2.32) picks
+        // ARGBToI420 instead, which swaps the R and B channels: the remote
+        // picture comes out with red/blue exchanged. Upstream rustdesk also
+        // reports Pixfmt::RGBA for this same capturer.
+        Pixfmt::RGBA
     }
 }
 
