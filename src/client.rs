@@ -264,19 +264,67 @@ impl Client {
         if config::is_incoming_only() {
             bail!("Incoming only mode");
         }
-        let hosts = crate::direct_access::direct_peer_hosts(peer, DEFAULT_DIRECT_PORT as u16);
+        // LUODA: 局域网直连优先。
+        //
+        // 手机端（Android/iOS）默认用 WebSocket 注册到 hbbs，nginx 转发后服务端
+        // 只能拿到 X-Real-IP，端口被写死为 0。这带来两个后果：
+        //   1. hbbs 记录的 peer 地址是「公网IP:0」，`handle_hole_sent` 把这个地址
+        //      回给主控端，主控端 `peer_addr.port() == 0` 会直接 bail；
+        //   2. 同网段快路径 `same_intranet` 判定不出 `peer_is_lan`，反而因为
+        //      `peer_is_lan ^ is_lan` 把 nat_type 改成 SYMMETRIC，被强制走中继。
+        // 也就是说：经 WebSocket 注册过的设备，TCP 打洞在协议层就不可用。
+        //
+        // 同局域网内唯一 100% 不依赖服务器的路径就是按广播发现结果直连。主控端
+        // 本来就会周期性向 255.255.255.255:21119 广播探测包，被控端会带自己的 ID
+        // 回 pong；我们把结果按 ID 命中后展开成候选地址直连，不经信令、不经中继。
+        let mut hosts = crate::direct_access::direct_peer_hosts(peer, DEFAULT_DIRECT_PORT as u16);
+        let mut via_lan = false;
+        if hosts.is_empty() {
+            let mut lan_hosts =
+                crate::direct_access::lan_peer_hosts(peer, DEFAULT_DIRECT_PORT as u16);
+            if lan_hosts.is_empty() {
+                // 缓存里没有这个 ID —— 连接前现场补一轮广播发现（硬上界 1.5s）。
+                // 不在同一局域网时空手而归，之后照常走信令链路，不受影响。
+                match crate::lan::discover_impl_within(std::time::Duration::from_millis(1500)).await
+                {
+                    Ok(_) => {
+                        lan_hosts =
+                            crate::direct_access::lan_peer_hosts(peer, DEFAULT_DIRECT_PORT as u16)
+                    }
+                    Err(err) => {
+                        log::debug!("lan discovery before connecting to {peer} failed: {err}")
+                    }
+                }
+            }
+            via_lan = !lan_hosts.is_empty();
+            hosts = lan_hosts;
+        }
         if !hosts.is_empty() {
-            log::info!("Direct connection to {peer}, candidates: {hosts:?}");
+            // 局域网候选只可能落在同一网段：要么秒连，要么就是不可达，
+            // 没必要耗满 CONNECT_TIMEOUT 才回落到信令链路。
+            const LAN_DIRECT_TIMEOUT: u64 = 1_500;
+            let timeout = if via_lan {
+                LAN_DIRECT_TIMEOUT
+            } else {
+                CONNECT_TIMEOUT
+            };
+            log::info!(
+                "Direct connection to {peer}, candidates: {hosts:?}, kind: {}, timeout: {timeout}",
+                if via_lan { "lan" } else { "ip" }
+            );
             crate::runtime_logger::info(
                 "DIRECT_CONNECT",
-                &format!("peer={peer}; candidates={}", hosts.join(",")),
+                &format!(
+                    "peer={peer}; kind={}; candidates={}",
+                    if via_lan { "lan" } else { "ip" },
+                    hosts.join(",")
+                ),
             );
             let futures: Vec<_> = hosts
                 .iter()
                 .map(|h| {
                     let h = h.clone();
-                    async move { connect_tcp_local(h.as_str(), None, CONNECT_TIMEOUT).await }
-                        .boxed()
+                    async move { connect_tcp_local(h.as_str(), None, timeout).await }.boxed()
                 })
                 .collect();
             match select_ok(futures).await {
@@ -638,7 +686,16 @@ impl Client {
         }
         drop(socket);
         if peer_addr.port() == 0 {
-            bail!("Failed to connect via rendezvous server");
+            // 端口 0 = 对端是经 WebSocket 注册到 hbbs 的。nginx 转发后服务端只剩
+            // X-Real-IP，源端口丢失，记录下来的就是「公网IP:0」。这种地址没法回连，
+            // TCP 打洞在协议层不可能成功，局域网直连才是可行路径
+            // （见本函数开头的「局域网直连优先」）。
+            bail!(
+                "Remote desktop is online but advertises no port for P2P \
+                 (it registered over websocket). Put this machine and the \
+                 controlled device on the same LAN, or set the controlled \
+                 device to register over plain TCP."
+            );
         }
         let time_used = start.elapsed().as_millis() as u64;
         log::info!(

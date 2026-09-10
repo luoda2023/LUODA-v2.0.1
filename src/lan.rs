@@ -18,7 +18,7 @@ use hbb_common::{
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 type Message = RendezvousMessage;
@@ -26,9 +26,36 @@ type Message = RendezvousMessage;
 #[cfg(not(target_os = "ios"))]
 pub(super) fn start_listening() -> ResultType<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], get_broadcast_port()));
-    let socket = std::net::UdpSocket::bind(addr)?;
+    // 绑定失败必须重试：调用方用的是 `allow_err!`，一旦这里直接返回 Err，
+    // 整个进程就永久失去局域网发现能力，且日志里只有一行 warn 很难被发现。
+    // 端口被上一个进程短暂占住（Android 上服务重建、Windows 上快速重启）
+    // 是最常见的原因，退避重试基本都能恢复。
+    let socket = {
+        let mut bound = None;
+        let mut last_err = None;
+        for attempt in 0..10 {
+            match std::net::UdpSocket::bind(addr) {
+                Ok(s) => {
+                    bound = Some(s);
+                    break;
+                }
+                Err(err) => {
+                    log::warn!(
+                        "lan discovery bind {addr} failed (attempt {}/10): {err}",
+                        attempt + 1
+                    );
+                    last_err = Some(err);
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            }
+        }
+        match bound {
+            Some(s) => s,
+            None => return Err(last_err.unwrap().into()),
+        }
+    };
     socket.set_read_timeout(Some(std::time::Duration::from_millis(1000)))?;
-    log::info!("lan discovery listener started");
+    log::info!("lan discovery listener started on {addr}");
     loop {
         let mut buf = [0; 2048];
         if let Ok((len, addr)) = socket.recv_from(&mut buf) {
@@ -73,14 +100,33 @@ pub(super) fn start_listening() -> ResultType<()> {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
-pub async fn discover() -> ResultType<()> {
+/// 单轮发现的默认等待窗口。局域网 pong 一般在几十毫秒内返回，3s 足够覆盖
+/// 多网卡 / 广播重传的情况。
+pub(crate) const DISCOVER_WINDOW: Duration = Duration::from_secs(3);
+
+/// 不依赖 `#[tokio::main]` 宏的发现实现，可以在任意 async 上下文里直接
+/// `await`（例如 `client::Client::_start` 在连接前补一轮发现）。
+///
+/// `overall` 是硬上界：收包的阻塞 socket 跑在独立线程里，调用方不会被拖住。
+pub async fn discover_impl_within(overall: Duration) -> ResultType<()> {
     let sockets = send_query()?;
-    let rx = spawn_wait_responses(sockets);
-    handle_received_peers(rx).await?;
+    let rx = spawn_wait_responses(sockets, overall);
+    // 只有跑满完整窗口的那一轮才把没回应的设备标记为离线。连接前补的那一轮
+    // 窗口很短（1.5s），如果也去清 online 标记，会把本来在线的设备误标成离线，
+    // 反而让下一次直连拿不到候选地址。
+    handle_received_peers(rx, overall >= DISCOVER_WINDOW).await?;
 
     log::info!("discover ping done");
     Ok(())
+}
+
+pub async fn discover_impl() -> ResultType<()> {
+    discover_impl_within(DISCOVER_WINDOW).await
+}
+
+#[tokio::main(flavor = "current_thread")]
+pub async fn discover() -> ResultType<()> {
+    discover_impl().await
 }
 
 pub fn send_wol(id: String) {
@@ -221,8 +267,10 @@ fn send_query() -> ResultType<Vec<UdpSocket>> {
 fn wait_response(
     socket: UdpSocket,
     timeout: Option<std::time::Duration>,
+    overall: Duration,
     tx: UnboundedSender<config::DiscoveryPeer>,
 ) -> ResultType<()> {
+    let started = Instant::now();
     let mut last_recv_time = Instant::now();
 
     let local_addr = socket.local_addr();
@@ -280,14 +328,17 @@ fn wait_response(
                 }
             }
         }
-        if last_recv_time.elapsed().as_millis() > 3_000 {
+        if started.elapsed() >= overall || last_recv_time.elapsed().as_millis() > 3_000 {
             break;
         }
     }
     Ok(())
 }
 
-fn spawn_wait_responses(sockets: Vec<UdpSocket>) -> UnboundedReceiver<config::DiscoveryPeer> {
+fn spawn_wait_responses(
+    sockets: Vec<UdpSocket>,
+    overall: Duration,
+) -> UnboundedReceiver<config::DiscoveryPeer> {
     let (tx, rx) = unbounded_channel::<_>();
     for socket in sockets {
         let tx_clone = tx.clone();
@@ -295,6 +346,7 @@ fn spawn_wait_responses(sockets: Vec<UdpSocket>) -> UnboundedReceiver<config::Di
             allow_err!(wait_response(
                 socket,
                 Some(std::time::Duration::from_millis(10)),
+                overall,
                 tx_clone
             ));
         });
@@ -302,11 +354,16 @@ fn spawn_wait_responses(sockets: Vec<UdpSocket>) -> UnboundedReceiver<config::Di
     rx
 }
 
-async fn handle_received_peers(mut rx: UnboundedReceiver<config::DiscoveryPeer>) -> ResultType<()> {
+async fn handle_received_peers(
+    mut rx: UnboundedReceiver<config::DiscoveryPeer>,
+    mark_stale_offline: bool,
+) -> ResultType<()> {
     let mut peers = config::LanPeers::load().peers;
-    peers.iter_mut().for_each(|peer| {
-        peer.online = false;
-    });
+    if mark_stale_offline {
+        peers.iter_mut().for_each(|peer| {
+            peer.online = false;
+        });
+    }
 
     let mut response_set = HashSet::new();
     let mut last_write_time: Option<Instant> = None;

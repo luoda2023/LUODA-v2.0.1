@@ -11,6 +11,12 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- 局域网发现保活：Rust 侧绑定 0.0.0.0:21119 监听 UDP 广播探测包，
+         没有 MulticastLock 时华为等 ROM 会把非单播报文直接丢弃，主控端
+         就找不到本机的局域网地址，只能退回打洞（经 WebSocket 注册的设备
+         端口为 0，打洞必然失败）。 -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <queries>
         <intent>

@@ -95,6 +95,14 @@ pub(crate) fn is_public_ipv4(address: Ipv4Addr) -> bool {
         && first < 240
 }
 
+/// 把一个 IP 展开成直连候选端口（`default_port` 起连续 `DIRECT_PORT_RANGE + 1` 个）。
+/// 被控端 hbbs 的 21118 可能被占用而回退到 21119/21120…，所以必须整段并发探测。
+fn hosts_for_ip(ip: IpAddr, default_port: u16) -> Vec<String> {
+    (default_port..=default_port.saturating_add(DIRECT_PORT_RANGE))
+        .map(|port| SocketAddr::new(ip, port).to_string())
+        .collect()
+}
+
 pub(crate) fn direct_peer_hosts(peer: &str, default_port: u16) -> Vec<String> {
     let peer = peer.trim();
     if let Ok(addr) = peer.parse::<SocketAddr>() {
@@ -102,12 +110,65 @@ pub(crate) fn direct_peer_hosts(peer: &str, default_port: u16) -> Vec<String> {
     }
 
     if let Ok(ip) = peer.parse::<IpAddr>() {
-        return (default_port..=default_port.saturating_add(DIRECT_PORT_RANGE))
-            .map(|port| SocketAddr::new(ip, port).to_string())
-            .collect();
+        return hosts_for_ip(ip, default_port);
     }
 
     Vec::new()
+}
+
+/// LUODA: 把「已发现的局域网设备 ID」解析成直连候选地址。
+///
+/// 背景（见 2.0.1-track 华为机型连不上的根因）：
+/// 手机端（Android/iOS）`use_ws()` 默认走 `wss://<server>/ws`(443) 注册到 hbbs，
+/// nginx 转发后服务端只能拿到 `X-Real-IP`，端口被写死成 0
+/// （LUODA-SERVER-API rendezvous_server.rs 的 ws 分支）。
+/// 于是 hbbs 记录的 peer 地址是 `公网IP:0`：
+///   1. `handle_punch_hole_request` 判定不出 `peer_is_lan` → 拿不到同网段快路径，
+///      还会因为 `peer_is_lan ^ is_lan` 把 nat_type 改成 SYMMETRIC → 被强制走中继；
+///   2. `handle_hole_sent` 把 `公网IP:0` 回给主控端 → 主控端 `peer_addr.port() == 0`
+///      直接 bail。
+/// 也就是说：**经 WebSocket 注册过的设备，TCP 打洞在协议层就不可用**。
+///
+/// 唯一 100% 不依赖服务器的 P2P 路径就是局域网直连：主控端本来就会周期性地向
+/// 255.255.255.255:21119 广播探测包，局域网内的被控端会带自己的 ID 回 pong，
+/// 我们把这份结果（`config::LanPeers`）按 ID 命中后展开成候选地址即可。
+/// 全程不经信令服务器、不经中继，符合「尽量 P2P / 局域网直连」的原则。
+///
+/// 只采信 `online == true` 的记录：上一轮探测没回应的条目留着只会白等一次
+/// `CONNECT_TIMEOUT`，拖慢后续的正常链路。
+pub(crate) fn lan_peer_hosts(peer: &str, default_port: u16) -> Vec<String> {
+    let peer = peer.trim();
+    if peer.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ips: Vec<IpAddr> = Vec::new();
+    for lan_peer in hbb_common::config::LanPeers::load().peers {
+        if !lan_peer.online || lan_peer.id != peer {
+            continue;
+        }
+        for ip in lan_peer.ip_mac.keys() {
+            let Ok(addr) = ip.parse::<IpAddr>() else {
+                continue;
+            };
+            if addr.is_loopback() || addr.is_unspecified() {
+                continue;
+            }
+            if !ips.contains(&addr) {
+                ips.push(addr);
+            }
+        }
+    }
+
+    let mut hosts = Vec::new();
+    for ip in ips {
+        for host in hosts_for_ip(ip, default_port) {
+            if !hosts.contains(&host) {
+                hosts.push(host);
+            }
+        }
+    }
+    hosts
 }
 
 #[cfg(test)]
@@ -196,5 +257,21 @@ mod tests {
         assert!(!is_public_ipv4(Ipv4Addr::new(10, 0, 0, 1)));
         assert!(!is_public_ipv4(Ipv4Addr::new(127, 0, 0, 1)));
         assert!(!is_public_ipv4(Ipv4Addr::new(169, 254, 1, 1)));
+    }
+
+    #[test]
+    fn hosts_for_ip_expands_full_port_range() {
+        let hosts = super::hosts_for_ip("192.168.31.70".parse().unwrap(), 21118);
+        assert_eq!(hosts.len(), 11);
+        assert_eq!(hosts.first().map(String::as_str), Some("192.168.31.70:21118"));
+        assert_eq!(hosts.last().map(String::as_str), Some("192.168.31.70:21128"));
+    }
+
+    #[test]
+    fn lan_peer_hosts_is_empty_for_unknown_or_empty_id() {
+        // 未知 ID 必须返回空，绝不能让局域网探测污染「按 IP 直连」与
+        // 正常的信令/打洞链路。
+        assert!(super::lan_peer_hosts("", 21118).is_empty());
+        assert!(super::lan_peer_hosts("__luoda_no_such_peer_id__", 21118).is_empty());
     }
 }

@@ -27,6 +27,7 @@ import android.media.*
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
+import android.net.wifi.WifiManager
 import android.os.*
 import android.util.DisplayMetrics
 import android.util.Log
@@ -248,6 +249,65 @@ class MainService : Service() {
     private lateinit var notificationChannel: String
     private lateinit var notificationBuilder: NotificationCompat.Builder
 
+    // 局域网发现保活锁，见 acquireLanDiscoveryLocks()
+    private var lanMulticastLock: WifiManager.MulticastLock? = null
+    private var lanWifiLock: WifiManager.WifiLock? = null
+
+    /**
+     * Rust 侧会绑定 `0.0.0.0:21119` 收 UDP 广播探测包，主控端（PC）据此在局域网内
+     * 直接按 ID 找到本机。华为 / 荣耀等 ROM 的后台管控会把非单播报文直接从 WiFi
+     * 驱动层丢掉，导致主控端只能退回服务器打洞；而手机端经 WebSocket 注册到 hbbs，
+     * 服务端只拿到 X-Real-IP、端口被写死成 0，打洞在协议层必然失败 —— 表现就是
+     * 「PC 能看到手机在线，但连不上」。
+     *
+     * 持有一个 MulticastLock 才能让驱动把非单播报文投递上来；WifiLock 则避免息屏后
+     * 射频进入省电模式漏收广播。
+     */
+    private fun acquireLanDiscoveryLocks() {
+        try {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            if (wm == null) {
+                Log.w(logTag, "lan discovery: WifiManager unavailable, skip locking")
+                return
+            }
+            if (lanMulticastLock == null) {
+                lanMulticastLock = wm.createMulticastLock("ldesk-lan-discovery").apply {
+                    setReferenceCounted(false)
+                }
+            }
+            lanMulticastLock?.let {
+                if (!it.isHeld) {
+                    it.acquire()
+                    Log.d(logTag, "lan discovery: MulticastLock acquired")
+                }
+            }
+            if (lanWifiLock == null) {
+                lanWifiLock = wm.createWifiLock(
+                    WifiManager.WIFI_MODE_FULL_HIGH_PERF, "ldesk-lan-discovery"
+                ).apply {
+                    setReferenceCounted(false)
+                }
+            }
+            lanWifiLock?.let {
+                if (!it.isHeld) {
+                    it.acquire()
+                    Log.d(logTag, "lan discovery: WifiLock acquired")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(logTag, "lan discovery: failed to acquire locks", e)
+        }
+    }
+
+    private fun releaseLanDiscoveryLocks() {
+        try {
+            lanMulticastLock?.let { if (it.isHeld) it.release() }
+            lanWifiLock?.let { if (it.isHeld) it.release() }
+        } catch (e: Exception) {
+            Log.e(logTag, "lan discovery: failed to release locks", e)
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         Log.d(logTag,"MainService onCreate, sdk int:${Build.VERSION.SDK_INT} reuseVirtualDisplay:$reuseVirtualDisplay")
@@ -266,6 +326,10 @@ class MainService : Service() {
         FFI.startServer(configPath, "")
 
         createForegroundNotification()
+
+        // 局域网发现保活：Rust 侧绑定 21119 的广播监听是在 startServer 里异步起的，
+        // 锁必须尽早持有，否则华为等 ROM 会丢掉探测包。
+        acquireLanDiscoveryLocks()
 
         // Reuse a previously granted MediaProjection token (survives process
         // death / service restart). Without this, a phone whose process was
@@ -289,6 +353,7 @@ class MainService : Service() {
             // ignore
         }
         checkMediaPermission()
+        releaseLanDiscoveryLocks()
         super.onDestroy()
     }
 
@@ -894,7 +959,7 @@ class MainService : Service() {
         val notification = notificationBuilder
             .setOngoing(false)
             .setPriority(NotificationCompat.PRIORITY_MAX)
-            .setContentTitle(translate("Do you accept?"))
+            .setContentTitle(translate("Do you want to accept remote assistance?"))
             .setContentText("$type:$username-$peerId")
             // .setStyle(MediaStyle().setShowActionsInCompactView(0, 1))
             // .addAction(R.drawable.check_blue, "check", genLoginRequestPendingIntent(true))
