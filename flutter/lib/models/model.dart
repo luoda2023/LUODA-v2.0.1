@@ -969,13 +969,34 @@ class FfiModel with ChangeNotifier {
     String text,
   ) {
     final lowerText = text.toLowerCase();
-    final transient = text == 'Remote desktop is offline' ||
+    // 对端账号切换 / 对端进程重启导致的离线：服务端 peer 离线阈值约 30s，很快恢复。
+    final peerOffline = text == 'Remote desktop is offline' ||
         text == 'Reset by the peer' ||
         lowerText.contains('connection closed') ||
         lowerText.contains('connection reset') ||
         lowerText.contains('broken pipe') ||
         lowerText.contains('10054') ||
         lowerText.contains('error 104');
+    // LUODA: 本机链路抖动。
+    //
+    // 手机在楼层的两个 AP 之间漫游、或 Wi-Fi 被系统省电掐掉时，正在跑的会话会以
+    // ECONNABORTED(os error 103) 结束，紧接着 ENETUNREACH(os error 101)、DNS
+    // 「No address associated with hostname」。从用户视角这就是"网络抖了一下"。
+    //
+    // 关键在于：这类抖动的第一次自动重连**必然落在断网窗口里**而失败，失败文案变成
+    // `Failed to connect directly to <id> using <ip:port>, ...`。旧实现只认上面
+    // peerOffline 那几个关键字，于是 hasRetry 变成 false —— 定时器被取消、退避被
+    // 清零，整条自动重连链就此断掉。网络 20 秒后自己恢复了，App 却再也不会重连，
+    // 用户看到的就是「断了之后回不来，必须手动重连」。
+    final linkLost = lowerText.contains('connection abort') ||
+        lowerText.contains('error 103') ||
+        lowerText.contains('unreachable') ||
+        lowerText.contains('error 101') ||
+        lowerText.contains('no address associated with hostname') ||
+        lowerText.contains('failed to connect directly') ||
+        lowerText.contains('failed to connect via') ||
+        lowerText.contains('please try later');
+    final transient = peerOffline || linkLost;
     if (type == 'error' &&
         title == 'Connection Error' &&
         transient &&
@@ -986,6 +1007,12 @@ class FfiModel with ChangeNotifier {
       // since the controlled side reconnects quickly after account changes.
       // Uses time-based check instead of _reconnects count because user can manually retry.
       // https://github.com/luoda/luoda/discussions/14048
+      //
+      // LUODA: 本机链路抖动的恢复时间取决于 AP 漫游 / 重新关联 / 拿到 DHCP 的耗时，
+      // 实测约 15~25s，而且重连前还有一轮局域网发现。退避是指数增长的（1/2/4/8/16/
+      // 32/64…），用 30s 窗口的话 32s 那一次会被挡在门外，等于刚断就永久放弃。
+      // 这里给链路抖动单独放宽到 180s：网络一恢复，下一次退避就能连上。
+      final window = linkLost ? 180 : 30;
       if (_offlineReconnectStartTime == null) {
         // First offline, record time and start retry
         _offlineReconnectStartTime = DateTime.now();
@@ -993,7 +1020,7 @@ class FfiModel with ChangeNotifier {
       } else {
         final elapsed =
             DateTime.now().difference(_offlineReconnectStartTime!).inSeconds;
-        if (elapsed < 30) {
+        if (elapsed < window) {
           return true;
         }
       }

@@ -279,6 +279,10 @@ impl Client {
         // 回 pong；我们把结果按 ID 命中后展开成候选地址直连，不经信令、不经中继。
         let mut hosts = crate::direct_access::direct_peer_hosts(peer, DEFAULT_DIRECT_PORT as u16);
         let mut via_lan = false;
+        // 这一轮是否已经「当场」发现过。缓存命中时是 false：`lan_peer_hosts` 只是
+        // 读一份从未在本轮校验过的缓存，地址可能早就过期（对端换了 IP / 换了网卡）。
+        // 后面直连失败时要靠这个标记决定是否值得补一次现场复查。
+        let mut lan_discovered = false;
         if hosts.is_empty() {
             let mut lan_hosts =
                 crate::direct_access::lan_peer_hosts(peer, DEFAULT_DIRECT_PORT as u16);
@@ -291,6 +295,7 @@ impl Client {
                 // pong），只发广播的话这类设备永远发现不了，只能回落信令链路，
                 // 而手机端经 WebSocket 注册后端口被写死为 0，打洞必然失败。
                 // 不在同一局域网时空手而归，之后照常走信令链路，不受影响。
+                lan_discovered = true;
                 match crate::lan::discover_lan_first_within(std::time::Duration::from_millis(1500))
                     .await
                 {
@@ -338,12 +343,76 @@ impl Client {
                 Ok((conn, _)) => {
                     return Ok(((conn, true, None, None, "TCP"), (0, "".to_owned()), false));
                 }
-                Err(e) => bail!(
-                    "Failed to connect directly to {} using {}: {}",
-                    peer,
-                    hosts.join(", "),
-                    e
-                ),
+                Err(e) => {
+                    if !via_lan {
+                        bail!(
+                            "Failed to connect directly to {} using {}: {}",
+                            peer,
+                            hosts.join(", "),
+                            e
+                        );
+                    }
+                    // 局域网候选全部连不上。
+                    //
+                    // 如果这批候选是**缓存**给的（本轮没当场复查过），先补一轮现场
+                    // 发现再重试一次：对端换过 IP / 换过网卡时，旧地址会让直连必然
+                    // 失败，而这个地址是唯一不经信令、不经中继的路径，不能因为一条
+                    // 过期记录就放弃。
+                    if !lan_discovered {
+                        match crate::lan::discover_lan_first_within(std::time::Duration::from_millis(
+                            1500,
+                        ))
+                        .await
+                        {
+                            Ok(_) => {
+                                let fresh = crate::direct_access::lan_peer_hosts(
+                                    peer,
+                                    DEFAULT_DIRECT_PORT as u16,
+                                );
+                                if !fresh.is_empty() && fresh != hosts {
+                                    log::info!(
+                                        "Direct connection retry to {peer}, candidates: {fresh:?}, kind: lan, timeout: {LAN_DIRECT_TIMEOUT}"
+                                    );
+                                    crate::runtime_logger::info(
+                                        "DIRECT_CONNECT",
+                                        &format!(
+                                            "peer={peer}; kind=lan-retry; candidates={}",
+                                            fresh.join(",")
+                                        ),
+                                    );
+                                    let retry: Vec<_> = fresh
+                                        .iter()
+                                        .map(|h| {
+                                            let h = h.clone();
+                                            async move {
+                                                connect_tcp_local(h.as_str(), None, LAN_DIRECT_TIMEOUT)
+                                                    .await
+                                            }
+                                            .boxed()
+                                        })
+                                        .collect();
+                                    if let Ok((conn, _)) = select_ok(retry).await {
+                                        return Ok((
+                                            (conn, true, None, None, "TCP"),
+                                            (0, "".to_owned()),
+                                            false,
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                log::debug!("lan re-discovery before connecting to {peer} failed: {err}")
+                            }
+                        }
+                    }
+                    // 局域网这条路确实走不通了，但**不能在这里直接放弃**：继续往下
+                    // 走信令 / 打洞链路，让上层拿到真正的失败原因（例如对端经
+                    // WebSocket 注册后端口为 0 时给出的可操作提示），而不是一句笼统的
+                    // 「直连失败」。原来这里是 bail!，等于把信令链路也一起掐断了。
+                    log::info!(
+                        "LAN direct connection to {peer} failed ({e}), falling back to signalling"
+                    );
+                }
             }
         }
         // Allow connect to {domain}:{port}
