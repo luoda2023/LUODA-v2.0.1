@@ -83,6 +83,8 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Coming soon...", "即将推出..."),
         ("Configure", "配置"),
         ("Confirm Delete", "确认删除"),
+        ("Confirm", "确认"),
+        ("Do you want to accept remote assistance?", "是否接收被远程协助？"),
         ("Confirm before closing multiple tabs", "关闭多个标签页时向您确认"),
         ("Confirmation", "确认"),
         ("Connect", "连接"),

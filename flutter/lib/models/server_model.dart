@@ -659,11 +659,10 @@ String get connectQrData {
               : client.isTerminal
                   ? "Terminal"
                   : "Share screen",
-      'Do you accept?',
-      'android_new_connection_tip',
-      () => sendLoginResponse(client, false),
-      () => sendLoginResponse(client, true),
-    );
+      'Do you want to accept remote assistance?',
+      'android_new_connection_tip', () => sendLoginResponse(client, false),
+ () => sendLoginResponse(client, true),
+ );
   }
 
   handleVoiceCall(Client client, bool accept) {
@@ -680,10 +679,8 @@ String get connectQrData {
       () => handleVoiceCall(client, false),
       () => handleVoiceCall(client, true),
     );
-  }
-
-  showClientDialog(Client client, String title, String contentTitle,
-      String content, VoidCallback onCancel, VoidCallback onSubmit) {
+  } showClientDialog(Client client, String title, String contentTitle,
+ String content, VoidCallback onCancel, VoidCallback onSubmit) {
     parent.target?.dialogManager.show((setState, close, context) {
       cancel() {
         onCancel();
@@ -715,8 +712,8 @@ String get connectQrData {
           ],
         ),
         actions: [
-          dialogButton("Dismiss", onPressed: cancel, isOutline: true),
-          dialogButton("Accept", onPressed: submit),
+ dialogButton("Dismiss", onPressed: cancel, isOutline: true),
+ dialogButton("Accept", onPressed: submit),
         ],
         onSubmit: submit,
         onCancel: cancel,

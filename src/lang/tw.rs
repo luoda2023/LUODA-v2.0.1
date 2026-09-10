@@ -95,6 +95,8 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Remote Computer", "遠端電腦"),
         ("Local Computer", "本機電腦"),
         ("Confirm Delete", "確認刪除"),
+        ("Confirm", "確認"),
+        ("Do you want to accept remote assistance?", "是否接收被遠端協助？"),
         ("Delete", "刪除"),
         ("Properties", "屬性"),
         ("Multi Select", "多選"),

@@ -649,13 +649,13 @@ class ConnectionManager extends StatelessWidget {
   Widget _buildNewConnectionHint(ServerModel serverModel, Client client) {
     return Row(mainAxisAlignment: MainAxisAlignment.end, children: [
       TextButton(
-          child: Text(translate("Dismiss")),
+          child: Text(translate("Cancel")),
           onPressed: () {
             serverModel.sendLoginResponse(client, false);
           }).marginOnly(right: 15),
       ElevatedButton.icon(
           icon: const Icon(Icons.check),
-          label: Text(translate("Accept")),
+          label: Text(translate("Confirm")),
           onPressed: () {
             serverModel.sendLoginResponse(client, true);
           }),

@@ -22,7 +22,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Change Password", "Change password"),
         ("Change Path", "Change path"),
         ("Coming soon...", "Coming soon..."),
-        ("Confirm Delete", "Confirm delete"),
+ ("Confirm Delete", "Confirm delete"),
         ("Connection Error", "Connection error"),
         ("Connection failed due to inactivity", "Automatically disconnected due to inactivity"),
         ("Continue with {$opLabel}", "Continue with {$opLabel}"),
