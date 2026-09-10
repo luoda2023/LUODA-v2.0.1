@@ -26,6 +26,7 @@ import android.hardware.display.VirtualDisplay
 import android.media.*
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.net.Uri
 import android.os.*
 import android.util.DisplayMetrics
 import android.util.Log
@@ -230,6 +231,8 @@ class MainService : Service() {
             _isStart = false
             mediaProjection = null
             virtualDisplay = null
+            // The OS revoked the grant; the persisted token is dead too.
+            clearProjectionToken()
             Handler(Looper.getMainLooper()).post {
                 MainActivity.flutterMethodChannel?.invokeMethod(
                     "on_media_projection_canceled", null)
@@ -263,6 +266,12 @@ class MainService : Service() {
         FFI.startServer(configPath, "")
 
         createForegroundNotification()
+
+        // Reuse a previously granted MediaProjection token (survives process
+        // death / service restart). Without this, a phone whose process was
+        // killed by the system would show the screen-capture dialog again on
+        // the next PC connection even though the user already granted it.
+        restoreProjectionToken()
     }
 
     override fun onDestroy() {
@@ -377,6 +386,10 @@ class MainService : Service() {
                 mediaProjection?.registerCallback(projectionCallback, serviceHandler)
                 checkMediaPermission()
                 _isReady = true
+                // Persist the grant so later process lifetimes (service restart,
+                // app killed by the system) can reuse it without re-showing the
+                // system screen-capture dialog.
+                saveProjectionToken(it)
                 // If capture was started but VirtualDisplay creation failed (e.g. single-app mode),
                 // retry with the new full MediaProjection
                 if (_isStart && virtualDisplay == null) {
@@ -427,6 +440,20 @@ class MainService : Service() {
     private fun ensureCaptureStarted() {
         if (isStart) return
         if (mediaProjection == null || !isReady) {
+            // Try to revive a previously persisted grant before asking again.
+            // This covers the case where the process died after the user
+            // authorized once - no dialog is needed while the token is valid.
+            if (restoreProjectionToken()) {
+                Log.d(logTag, "ensureCaptureStarted: reused persisted projection token")
+                if (startCapture()) {
+                    return
+                }
+                // The revived token passed getMediaProjection but could not
+                // create a VirtualDisplay (stale grant). It has been cleared by
+                // invalidateProjection(); fall through to a fresh grant so this
+                // connection succeeds instead of silently showing a black screen.
+                Log.w(logTag, "ensureCaptureStarted: restored token unusable, requesting fresh grant")
+            }
             Log.d(logTag, "ensureCaptureStarted: no projection token, requesting once")
             val projectionIntent = Intent(this, PermissionRequestTransparentActivity::class.java).apply {
                 action = ACT_REQUEST_MEDIA_PROJECTION
@@ -683,7 +710,86 @@ class MainService : Service() {
         mediaProjection = null
         _isReady = false
         _isStart = false
+        // The token can no longer create a VirtualDisplay; drop it so the next
+        // connection goes through a fresh authorization instead of retrying a
+        // dead grant every time.
+        clearProjectionToken()
         checkMediaPermission()
+    }
+
+    // ------------------------------------------------------------------
+    // Persisted MediaProjection token ("remember the screen-capture grant")
+    // ------------------------------------------------------------------
+
+    /// Persist the grant result data so a later process lifetime can restore it.
+    /// The token stays valid until the OS revokes it; stale tokens are detected
+    /// on restore and cleared, so we never retry a dead grant in a loop.
+    private fun saveProjectionToken(resultData: Intent) {
+        try {
+            val data = resultData.data?.toString()
+            if (!data.isNullOrEmpty()) {
+                applicationContext.getSharedPreferences(KEY_SHARED_PREFERENCES, MODE_PRIVATE)
+                    .edit()
+                    .putString(KEY_MEDIA_PROJECTION_TOKEN, data)
+                    .apply()
+                Log.d(logTag, "saveProjectionToken: persisted screen-capture grant")
+            } else {
+                // Some OEM MediaProjection results carry the token in extras
+                // instead of data; keep it visible in logs so a device that
+                // "never remembers" the grant can be diagnosed.
+                Log.w(logTag, "saveProjectionToken: result intent has no data Uri, grant cannot be persisted")
+            }
+        } catch (e: Exception) {
+            Log.w(logTag, "saveProjectionToken failed: ${e.message}")
+        }
+    }
+
+    private fun clearProjectionToken() {
+        try {
+            applicationContext.getSharedPreferences(KEY_SHARED_PREFERENCES, MODE_PRIVATE)
+                .edit()
+                .remove(KEY_MEDIA_PROJECTION_TOKEN)
+                .apply()
+        } catch (e: Exception) {
+            Log.w(logTag, "clearProjectionToken failed: ${e.message}")
+        }
+    }
+
+    /// Rebuild the MediaProjection from a previously persisted grant.
+    /// Returns true when a still-valid projection was restored; false when
+    /// there is no persisted token or the system revoked it (token cleared).
+    private fun restoreProjectionToken(): Boolean {
+        if (mediaProjection != null && isReady) return true
+        val tokenData = try {
+            applicationContext.getSharedPreferences(KEY_SHARED_PREFERENCES, MODE_PRIVATE)
+                .getString(KEY_MEDIA_PROJECTION_TOKEN, null)
+        } catch (e: Exception) {
+            Log.w(logTag, "readProjectionToken failed: ${e.message}")
+            null
+        }
+        if (tokenData.isNullOrEmpty()) return false
+        return try {
+            val mediaProjectionManager =
+                getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            val restoreIntent = Intent().apply { setData(Uri.parse(tokenData)) }
+            val mp = mediaProjectionManager.getMediaProjection(Activity.RESULT_OK, restoreIntent)
+            if (mp == null) {
+                Log.w(logTag, "restoreProjectionToken: token no longer valid, clearing")
+                clearProjectionToken()
+                false
+            } else {
+                mediaProjection = mp
+                mediaProjection?.registerCallback(projectionCallback, serviceHandler)
+                _isReady = true
+                checkMediaPermission()
+                Log.d(logTag, "restoreProjectionToken: restored previously granted projection")
+                true
+            }
+        } catch (e: Exception) {
+            Log.w(logTag, "restoreProjectionToken: restore failed (${e.message}), clearing")
+            clearProjectionToken()
+            false
+        }
     }
 
     private val cb: MediaCodec.Callback = object : MediaCodec.Callback() {

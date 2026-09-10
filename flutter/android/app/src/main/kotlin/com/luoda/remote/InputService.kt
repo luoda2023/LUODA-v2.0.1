@@ -8,6 +8,7 @@ package com.luoda.remote
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.content.Intent
 import android.graphics.Path
 import android.os.Build
 import android.os.Bundle
@@ -713,6 +714,19 @@ class InputService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
     }
 
+    /// Notify Flutter about the live input-service state on lifecycle changes.
+    /// Without this, the "Share screen" toggle stays stale after the system
+    /// recycles or auto-restarts the accessibility service: it would still
+    /// show "on" while the service is gone (or never light up after a
+    /// system-triggered restart).  Safe to call when the channel is not ready
+    /// (e.g. service restarted by the system while the app is backgrounded).
+    private fun notifyInputState() {
+        MainActivity.flutterMethodChannel?.invokeMethod(
+            "on_state_changed",
+            mapOf("name" to "input", "value" to isOpen.toString())
+        )
+    }
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         ctx = this
@@ -730,11 +744,36 @@ class InputService : AccessibilityService() {
         val layout = fakeEditTextForTextStateCalculation?.getLayout()
         Log.d(logTag, "fakeEditTextForTextStateCalculation layout:$layout")
         Log.d(logTag, "onServiceConnected!")
+        // Reflect the (re)connection immediately - including system-triggered
+        // auto-restarts after the process was killed.
+        notifyInputState()
     }
 
     override fun onDestroy() {
+        Log.d(logTag, "onDestroy: accessibility service destroyed")
         ctx = null
+        notifyInputState()
         super.onDestroy()
+    }
+
+    /// The system may unbind (and later rebind) the accessibility service
+    /// without destroying it - e.g. when the process is being killed for
+    /// memory or when the ROM re-binds after a cleanup.  Clear ctx here so
+    /// remote input silently degrades instead of operating on a stale
+    /// instance, and return true so the system keeps this binding around for
+    /// a rebind instead of treating it as gone.
+    override fun onUnbind(intent: Intent?): Boolean {
+        Log.d(logTag, "onUnbind: accessibility service unbound")
+        ctx = null
+        notifyInputState()
+        return true
+    }
+
+    override fun onRebind(intent: Intent?) {
+        super.onRebind(intent)
+        // A fresh connection goes through onServiceConnected(), which
+        // re-populates ctx and re-creates the text-state EditText.
+        Log.d(logTag, "onRebind: accessibility service rebound")
     }
 
     override fun onInterrupt() {}

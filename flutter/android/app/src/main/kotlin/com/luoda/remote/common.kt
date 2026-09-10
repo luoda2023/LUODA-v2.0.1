@@ -60,6 +60,10 @@ const val KEY_SHARED_PREFERENCES = "KEY_SHARED_PREFERENCES"
 const val KEY_START_ON_BOOT_OPT = "KEY_START_ON_BOOT_OPT"
 const val KEY_APP_DIR_CONFIG_PATH = "KEY_APP_DIR_CONFIG_PATH"
 const val KEY_FIRST_RUN_AUTHORIZATION = "KEY_FIRST_RUN_AUTHORIZATION"
+// Persisted MediaProjection grant: the result Intent data Uri survives process
+// death / service restart, so a previously authorized phone does not need to
+// show the system screen-capture dialog again (until the OS revokes the token).
+const val KEY_MEDIA_PROJECTION_TOKEN = "KEY_MEDIA_PROJECTION_TOKEN"
 
 @SuppressLint("ConstantLocale")
 val LOCAL_NAME = Locale.getDefault().toString()
