@@ -121,6 +121,22 @@ class FfiModel with ChangeNotifier {
   Timer? _timer;
   var _reconnects = 1;
   DateTime? _offlineReconnectStartTime;
+
+  /// LUODA: 链路抖动自动重连看门狗（详见 [_linkLostWatchdogTick] 的说明）。
+  Timer? _linkLostWatchdog;
+  bool _linkLostReconnecting = false;
+  int _linkLostDelay = 1;
+  DateTime? _linkLostStart;
+  DateTime? _linkLostLastAttempt;
+  String _linkLostReason = '';
+
+  /// 看门狗最多自愈多久（秒）。超时后不再自动重连，交给用户手动处理。
+  static const int _kLinkLostMaxWindowSeconds = 300;
+
+  /// 看门狗退避上限（秒）。链路抖动恢复时间不可预知，退避封顶在这个值，
+  /// 保证网络一恢复，最多 30 秒内一定能撞上一次重连。
+  static const int _kLinkLostMaxDelaySeconds = 30;
+
   bool _viewOnly = false;
   bool _showMyCursor = false;
   WeakReference<FFI> parent;
@@ -341,6 +357,10 @@ class FfiModel with ChangeNotifier {
       } else if (name == 'sync_platform_additions') {
         handlePlatformAdditions(evt, sessionId, peerId);
       } else if (name == 'connection_ready') {
+        // LUODA: 连上了，收掉链路抖动的自动重连看门狗。
+        stopLinkLostWatchdog('connection_ready');
+        _reconnects = 1;
+        _offlineReconnectStartTime = null;
         setConnectionType(peerId, evt['secure'] == 'true',
             evt['direct'] == 'true', evt['stream_type'] ?? '');
       } else if (name == 'switch_display') {
@@ -947,6 +967,8 @@ class FfiModel with ChangeNotifier {
     } else if (type == 'relay-hint' || type == 'relay-hint2') {
       showRelayHintDialog(sessionId, type, title, text, dialogManager, peerId);
     } else if (text == kMsgboxTextWaitingForImage) {
+      // LUODA: 走到这里说明对端已经认下这次会话，重连成功。
+      stopLinkLostWatchdog('waiting for image');
       showConnectedWaitingForImage(dialogManager, sessionId, type, title, text);
     } else if (title == 'Privacy mode') {
       final hasRetry = evt['hasRetry'] == 'true';
@@ -954,11 +976,105 @@ class FfiModel with ChangeNotifier {
           sessionId, type, title, text, link, hasRetry, dialogManager);
     } else {
       var hasRetry = evt['hasRetry'] == 'true';
-      if (!hasRetry) {
+      if (isLinkLostError(title, text)) {
+        // LUODA: 本机链路抖动（AP 漫游 / Wi-Fi 被系统掐断）导致的掉线。
+        // 这类掉线必须自动重连，但**不能**依赖"这条 msgbox 送达 UI"来推进重连
+        // 链——实测第二次失败的 msgbox 没能驱动后续重连，退避链就此断掉。
+        // 改用与会话事件流解耦的看门狗来驱动，msgbox 只负责把界面显示出来。
+        hasRetry = true;
+        startLinkLostWatchdog(text);
+      } else if (!hasRetry) {
         hasRetry = shouldAutoRetryOnOffline(type, title, text);
       }
       showMsgBox(sessionId, type, title, text, link, hasRetry, dialogManager);
     }
+  }
+
+  /// LUODA: 判定一条 Connection Error 是否属于"本机链路抖动"。
+  ///
+  /// 手机在楼层两个 AP 之间漫游、或 Wi-Fi 被系统省电策略掐掉时，正在跑的会话
+  /// 会以 ECONNABORTED(os error 103) 立刻结束；紧接着的自动重连会落在断网窗口
+  /// 里，失败文案变成 ENETUNREACH(os error 101)、
+  /// 「No address associated with hostname」、或
+  /// 「failed to connect to 192.168.x.x:211xx」。
+  bool isLinkLostError(String title, String text) {
+    if (title != 'Connection Error') return false;
+    final t = text.toLowerCase();
+    return t.contains('connection abort') ||
+        t.contains('error 103') ||
+        t.contains('unreachable') ||
+        t.contains('error 101') ||
+        t.contains('no address associated with hostname') ||
+        t.contains('lookup address information') ||
+        t.contains('failed to connect directly') ||
+        t.contains('failed to connect to ') ||
+        t.contains('failed to connect via') ||
+        t.contains('please try later');
+  }
+
+  OverlayDialogManager? get _sessionDialogManager =>
+      parent.target?.dialogManager;
+
+  /// 启动/续接链路抖动看门狗。已经在跑就只更新原因，不重置退避。
+  void startLinkLostWatchdog(String reason) {
+    _linkLostReason = reason;
+    if (_linkLostReconnecting) return;
+    _linkLostReconnecting = true;
+    _linkLostDelay = 1;
+    _linkLostStart = DateTime.now();
+    _linkLostLastAttempt = null;
+    debugPrint('[LUODA-RC] link-lost watchdog armed, reason="$reason"');
+    _linkLostWatchdog?.cancel();
+    _linkLostWatchdog = Timer(const Duration(seconds: 1), _linkLostWatchdogTick);
+  }
+
+  /// 停止看门狗（连上 / 会话结束 / 超过总窗口时调用）。
+  void stopLinkLostWatchdog([String why = '']) {
+    if (_linkLostWatchdog != null || _linkLostReconnecting) {
+      debugPrint('[LUODA-RC] link-lost watchdog stopped ($why)');
+    }
+    _linkLostWatchdog?.cancel();
+    _linkLostWatchdog = null;
+    _linkLostReconnecting = false;
+    _linkLostDelay = 1;
+    _linkLostStart = null;
+    _linkLostLastAttempt = null;
+  }
+
+  /// 看门狗节拍：每 1 秒醒来一次，按 1/2/4/8/16/30/30… 的退避发起重连。
+  ///
+  /// 与旧的 msgbox 定时器相比，它的唯一输入是"会话是否已经被判定为掉线"，
+  /// 不依赖任何后续事件送达，因此不会因为某一条 msgbox 丢失而永久停摆。
+  void _linkLostWatchdogTick() {
+    if (!_linkLostReconnecting) return;
+    final now = DateTime.now();
+    final start = _linkLostStart;
+    if (start == null || now.difference(start).inSeconds > _kLinkLostMaxWindowSeconds) {
+      stopLinkLostWatchdog('window expired');
+      return;
+    }
+    final last = _linkLostLastAttempt;
+    if (last == null || now.difference(last).inSeconds >= _linkLostDelay) {
+      _linkLostLastAttempt = now;
+      final used = _linkLostDelay;
+      _linkLostDelay = _linkLostDelay * 2;
+      if (_linkLostDelay > _kLinkLostMaxDelaySeconds) {
+        _linkLostDelay = _kLinkLostMaxDelaySeconds;
+      }
+      final dm = _sessionDialogManager;
+      if (dm == null) {
+        stopLinkLostWatchdog('no dialog manager');
+        return;
+      }
+      debugPrint(
+          '[LUODA-RC] watchdog reconnect attempt (backoff was ${used}s, elapsed ${now.difference(start).inSeconds}s, reason="$_linkLostReason")');
+      try {
+        reconnect(dm, sessionId, false);
+      } catch (e) {
+        debugPrint('[LUODA-RC] watchdog reconnect threw: $e');
+      }
+    }
+    _linkLostWatchdog = Timer(const Duration(seconds: 1), _linkLostWatchdogTick);
   }
 
   /// Auto-retry check for transient connection errors.
@@ -1090,11 +1206,16 @@ class FfiModel with ChangeNotifier {
           onSubmit: onSubmit);
     }
     _timer?.cancel();
+    _timer = null;
     if (hasRetry) {
-      _timer = Timer(Duration(seconds: _reconnects), () {
-        reconnect(dialogManager, sessionId, false);
-      });
-      _reconnects *= 2;
+      // LUODA: 链路抖动时由看门狗独占驱动重连，这里不再重复装一次性定时器，
+      // 否则两条链会互相打断（各自 cancel 对方刚发起的重连）。
+      if (!_linkLostReconnecting) {
+        _timer = Timer(Duration(seconds: _reconnects), () {
+          reconnect(dialogManager, sessionId, false);
+        });
+        _reconnects *= 2;
+      }
     } else {
       _reconnects = 1;
       _offlineReconnectStartTime = null;
@@ -3897,6 +4018,8 @@ class FFI {
         if (message is EventToUI_Event) {
           if (message.field0 == "close") {
             closed = true;
+            // LUODA: 会话被真正关闭（用户主动断开等），停掉自动重连看门狗。
+            ffiModel.stopLinkLostWatchdog('session close event');
             debugPrint('Exit session event loop');
             return;
           }

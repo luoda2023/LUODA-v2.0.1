@@ -251,11 +251,33 @@ jobs:
           if-no-files-found: ignore
       - name: Upload to Release (nightly x64 only)
         if: matrix.arch == 'x64'
-        uses: softprops/action-gh-release@v1
-        with:
-          prerelease: false
-          tag_name: v${{ env.LDESK_VERSION }}
-          files: |
-            SignOutput/LDesk-portable-x64.exe
-            SignOutput/LDesk-install.exe
-            SignOutput/LDesk-service-x64.zip
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="v${LDESK_VERSION}"
+          # EXE 工作流与 APK 工作流会并行给同一个 tag 发版，谁先跑完谁建 release。
+          # 后来者必须复用已有 release 并用 --clobber 覆盖资产 —— 旧的
+          # softprops/action-gh-release@v1 遇到 tag/release 已存在会直接抛
+          # already_exists 失败。v2.2.33 / v2.2.35 的 EXE 就是这样反复发布失败、
+          # Release 里只有 APK 没有 exe 的。
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists, uploading assets into it"
+          else
+            gh release create "$TAG" --title "$TAG" --notes "LDesk $TAG" --latest
+          fi
+
+          files=()
+          for f in \
+            SignOutput/LDesk-portable-x64.exe \
+            SignOutput/LDesk-install.exe \
+            SignOutput/LDesk-service-x64.zip ; do
+            if [ -s "$f" ]; then files+=("$f"); else echo "WARN: missing asset $f"; fi
+          done
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "ERROR: no release assets produced"; exit 1
+          fi
+          gh release upload "$TAG" "${files[@]}" --clobber
+          echo "=== release $TAG assets ==="
+          gh release view "$TAG" --json assets --jq '.assets[] | "  \(.name)  \(.size) bytes"'

@@ -75,6 +75,20 @@ jobs:
           LUODA_ANDROID_KEY_PASSWORD: ${{ secrets.LUODA_ANDROID_KEY_PASSWORD }}
         run: |
           set -euo pipefail
+
+          # 仓库内已经带了正式签名用的 keystore（见 "Restore stable signing keystore"
+          # 步骤），此时 secrets 缺不缺都不影响出包，只做提示。
+          if [ -s "flutter/android/app/luoda-release.keystore" ] \
+            && [ -s "flutter/android/key.properties" ]; then
+            echo "OK: in-repo signing keystore present; Actions signing secrets are optional"
+            for name in LUODA_ANDROID_KEYSTORE_BASE64 LUODA_ANDROID_STORE_PASSWORD LUODA_ANDROID_KEY_ALIAS LUODA_ANDROID_KEY_PASSWORD; do
+              if [ -z "${!name:-}" ]; then
+                echo "NOTE: signing secret $name is not set (unused, in-repo keystore wins)"
+              fi
+            done
+            exit 0
+          fi
+
           for name in LUODA_ANDROID_KEYSTORE_BASE64 LUODA_ANDROID_STORE_PASSWORD LUODA_ANDROID_KEY_ALIAS LUODA_ANDROID_KEY_PASSWORD; do
             test -n "${!name:-}" || { echo "ERROR: Android signing secret $name is missing"; exit 1; }
           done
@@ -346,6 +360,38 @@ jobs:
           LUODA_ANDROID_KEY_PASSWORD: ${{ secrets.LUODA_ANDROID_KEY_PASSWORD }}
         run: |
           set -euo pipefail
+
+          # ------------------------------------------------------------------
+          # 签名必须用"设备上已装 APK 的那把钥匙"。
+          # 否则 adb install -r / 应用内更新会报
+          #   INSTALL_FAILED_UPDATE_INCOMPATIBLE: signatures do not match
+          # 用户只能卸载重装，配置全丢。
+          #
+          # 实测：仓库里自带的 luoda-release.keystore（alias=luoda，DN
+          # CN=LUODA,OU=LUODA,O=LUODA）才是手机上装着的那把；Actions secrets
+          # 里的另一把（DN OU=Mobile,O=LUODA,CN=LUODA Android Release）签名不符。
+          # 仓库里的 keystore 与 key.properties 本来就被 git 跟踪（历史遗留），
+          # 所以这里优先用它，保证 CI 产物可以直接原地升级。
+          # ------------------------------------------------------------------
+          REPO_KEYSTORE="flutter/android/app/luoda-release.keystore"
+          REPO_PROPS="flutter/android/key.properties"
+          if [ -s "$REPO_KEYSTORE" ] && [ -s "$REPO_PROPS" ]; then
+            R_STORE_FILE="$(sed -n 's/^storeFile=//p' "$REPO_PROPS" | tr -d '\r')"
+            R_ALIAS="$(sed -n 's/^keyAlias=//p' "$REPO_PROPS" | tr -d '\r')"
+            R_PASS="$(sed -n 's/^storePassword=//p' "$REPO_PROPS" | tr -d '\r')"
+            if [ -n "$R_STORE_FILE" ] && [ -n "$R_ALIAS" ] && [ -n "$R_PASS" ] \
+              && keytool -list -keystore "$REPO_KEYSTORE" -storepass "$R_PASS" -alias "$R_ALIAS" > /dev/null 2>&1; then
+              echo "OK: using in-repo keystore '$R_STORE_FILE' (alias=$R_ALIAS) — matches installed app"
+              echo "=== signing cert fingerprint ==="
+              keytool -list -v -keystore "$REPO_KEYSTORE" -storepass "$R_PASS" -alias "$R_ALIAS" 2>/dev/null \
+                | grep -E "SHA256:|SHA-256:" | head -2 || true
+              exit 0
+            fi
+            echo "WARN: in-repo keystore present but unusable, falling back to Actions secrets"
+          else
+            echo "WARN: in-repo keystore/key.properties missing, falling back to Actions secrets"
+          fi
+
           missing_secret=false
           for name in LUODA_ANDROID_KEYSTORE_BASE64 LUODA_ANDROID_STORE_PASSWORD LUODA_ANDROID_KEY_ALIAS LUODA_ANDROID_KEY_PASSWORD; do
             if [ -z "${!name:-}" ]; then
@@ -482,11 +528,28 @@ jobs:
           if-no-files-found: error
 
       - name: Upload to Release
-        uses: softprops/action-gh-release@v1
-        with:
-          prerelease: false
-          tag_name: v${{ env.LDESK_VERSION }}
-          files: flutter/build/app/outputs/dist-apk/*.apk
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="v${LDESK_VERSION}"
+          # 与 EXE 工作流共用同一个 tag。谁先跑完谁建 release，后来者复用 + clobber，
+          # 不再因为 release 已存在而失败（旧 softprops/action-gh-release@v1 会抛
+          # already_exists）。
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists, uploading assets into it"
+          else
+            gh release create "$TAG" --title "$TAG" --notes "LDesk $TAG" --latest
+          fi
+          shopt -s nullglob
+          files=(flutter/build/app/outputs/dist-apk/*.apk)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "ERROR: no APK assets produced"; exit 1
+          fi
+          gh release upload "$TAG" "${files[@]}" --clobber
+          echo "=== release $TAG assets ==="
+          gh release view "$TAG" --json assets --jq '.assets[] | "  \(.name)  \(.size) bytes"'
       - name: Upload runtime logs (always)
         if: always()
         uses: actions/upload-artifact@v4
