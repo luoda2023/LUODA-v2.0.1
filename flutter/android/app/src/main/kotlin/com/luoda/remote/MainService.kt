@@ -26,7 +26,6 @@ import android.hardware.display.VirtualDisplay
 import android.media.*
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
-import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.*
 import android.util.DisplayMetrics
@@ -225,18 +224,36 @@ class MainService : Service() {
     /// Callback to detect MediaProjection revocation at runtime.
     /// Without this, _isReady stays true after the OS tears down the projection,
     /// preventing the app from re-requesting screen capture permission.
+    ///
+    /// 运行期竞态（2026-09-11 华为实测复现）：本回调跑在 `serviceHandler` 线程上，
+    /// 而 EMUI/Android 会在「同机另一个 App 抢走投屏」时立刻撤销我们刚拿到的投影
+    /// —— 撤销时刻可能正好落在 `startCapture()` 的执行中途。历史版本里
+    /// `startCapture()` 在 null 检查之后又用 `mediaProjection!!` 二次解引用，
+    /// 竞态命中就抛 NullPointerException 把整个进程带走。用户看到的现象是
+    /// 「被控端 App 突然退出，主控端仍显示已连接但没有画面」。
+    /// 现在：
+    ///   1) `startCapture()` 全程只操作局部快照，绝不二次读字段；
+    ///   2) 本回调把已建好的采集资源释放干净，避免 Surface/ImageReader 泄漏；
+    ///   3) 只把状态标记为「投影已失效」，下一次连接自然会重新申请授权。
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
             Log.w(logTag, "MediaProjection stopped by system; resetting state")
+            val wasCapturing = _isStart
             _isReady = false
             _isStart = false
             mediaProjection = null
-            virtualDisplay = null
-            // The OS revoked the grant; the persisted token is dead too.
-            clearProjectionToken()
+            // 投影已死 → VirtualDisplay 一并失效，必须真正释放而不是只暂停。
+            releaseCaptureResources(forceReleaseDisplay = true)
             Handler(Looper.getMainLooper()).post {
                 MainActivity.flutterMethodChannel?.invokeMethod(
                     "on_media_projection_canceled", null)
+            }
+            if (wasCapturing) {
+                Log.w(
+                    logTag,
+                    "projection revoked mid-session; capture resources released, " +
+                        "next connection will request a fresh grant"
+                )
             }
         }
     }
@@ -331,11 +348,9 @@ class MainService : Service() {
         // 锁必须尽早持有，否则华为等 ROM 会丢掉探测包。
         acquireLanDiscoveryLocks()
 
-        // Reuse a previously granted MediaProjection token (survives process
-        // death / service restart). Without this, a phone whose process was
-        // killed by the system would show the screen-capture dialog again on
-        // the next PC connection even though the user already granted it.
-        restoreProjectionToken()
+        // 不要试图在这里恢复上次的投屏授权：MediaProjection 授权无法跨进程持久化
+        // （结果 Intent 里没有可用的 data Uri，令牌是 IBinder 落不了盘）。
+        // 详见 invalidateProjection() 下方的说明。进程重建后必须重新授权一次。
     }
 
     override fun onDestroy() {
@@ -451,10 +466,7 @@ class MainService : Service() {
                 mediaProjection?.registerCallback(projectionCallback, serviceHandler)
                 checkMediaPermission()
                 _isReady = true
-                // Persist the grant so later process lifetimes (service restart,
-                // app killed by the system) can reuse it without re-showing the
-                // system screen-capture dialog.
-                saveProjectionToken(it)
+                // 授权到手即在本次进程内生效（不落盘，见 invalidateProjection() 下方说明）。
                 // If capture was started but VirtualDisplay creation failed (e.g. single-app mode),
                 // retry with the new full MediaProjection
                 if (_isStart && virtualDisplay == null) {
@@ -498,28 +510,18 @@ class MainService : Service() {
         startActivity(intent)
     }
 
-    /// Start screen capture for an already-authorized session. If the OS
-    /// projection token is not held yet (first remote session, token revoked by
-    /// the system), request it once through the transparent activity and start
-    /// capture as soon as the grant returns.
+    /// Start screen capture for an already-authorized session.
+    ///
+    /// 语义（2026-09-11 重新明确）：**授权一次，在本次进程存活期间一直复用**。
+    /// 只要 `mediaProjection` 还在且 `isReady`，就直接起采集、绝不弹窗；
+    /// 只有投影真的不存在（首次被控 / 进程被系统回收 / 投影被系统撤销）时，
+    /// 才通过透明 Activity 走一次系统授权。
+    /// 「进程重建后要重新授权」是 Android 平台约束（授权不可持久化，
+    /// 见 invalidateProjection() 下方的说明），不是这里的逻辑问题。
     private fun ensureCaptureStarted() {
         if (isStart) return
         if (mediaProjection == null || !isReady) {
-            // Try to revive a previously persisted grant before asking again.
-            // This covers the case where the process died after the user
-            // authorized once - no dialog is needed while the token is valid.
-            if (restoreProjectionToken()) {
-                Log.d(logTag, "ensureCaptureStarted: reused persisted projection token")
-                if (startCapture()) {
-                    return
-                }
-                // The revived token passed getMediaProjection but could not
-                // create a VirtualDisplay (stale grant). It has been cleared by
-                // invalidateProjection(); fall through to a fresh grant so this
-                // connection succeeds instead of silently showing a black screen.
-                Log.w(logTag, "ensureCaptureStarted: restored token unusable, requesting fresh grant")
-            }
-            Log.d(logTag, "ensureCaptureStarted: no projection token, requesting once")
+            Log.d(logTag, "ensureCaptureStarted: no live projection, requesting system grant once")
             val projectionIntent = Intent(this, PermissionRequestTransparentActivity::class.java).apply {
                 action = ACT_REQUEST_MEDIA_PROJECTION
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK
@@ -572,11 +574,66 @@ class MainService : Service() {
         return audioRecordHandle.onVoiceCallClosed(mediaProjection)
     }
 
+    /// 释放采集侧资源（VirtualDisplay / ImageReader / Surface / 编码器）。
+    /// 可重复调用、可从任意线程调用：`onStop()` 在系统撤销投影时用它清理，
+    /// `startCapture()` 失败回滚时也用它，避免「投影已经没了但 Surface 和
+    /// ImageReader 还挂着」造成句柄泄漏与永久黑屏。
+    ///
+    /// [forceReleaseDisplay] 必须为 true 的情形：**底层 MediaProjection 已经死了**。
+    /// 此时 VirtualDisplay 也一起失效，只能真正 release —— 否则会被
+    /// `createOrSetVirtualDisplay()` 的 `virtualDisplay?.let { setSurface(...) }`
+    /// 复用成「挂在死投影上的虚拟屏」，画面永远出不来。
+    /// 而正常「暂停一次会话但投影仍有效」的场景（`stopCapture`）保持 false，
+    /// 这样下一次连接能零成本复用同一个 VirtualDisplay。
+    /// 注意：本方法与 `stopCapture()` 共用同一把对象锁（`@Synchronized`），
+    /// 避免 serviceHandler 线程释放资源的同时主线程正在建 Surface。
+    @Synchronized
+    private fun releaseCaptureResources(forceReleaseDisplay: Boolean = false) {
+        try {
+            if (forceReleaseDisplay || !reuseVirtualDisplay) {
+                virtualDisplay?.release()
+                virtualDisplay = null
+            } else {
+                virtualDisplay?.setSurface(null)
+            }
+        } catch (e: Exception) {
+            Log.w(logTag, "releaseCaptureResources: virtual display release failed: ${e.message}")
+            virtualDisplay = null
+        }
+        // imageReader 必须在它持有的 surface 释放之前关闭
+        try {
+            imageReader?.close()
+        } catch (e: Exception) {
+            Log.w(logTag, "releaseCaptureResources: imageReader close failed: ${e.message}")
+        }
+        imageReader = null
+        videoEncoder?.let {
+            try {
+                it.signalEndOfInputStream()
+                it.stop()
+                it.release()
+            } catch (e: Exception) {
+                Log.w(logTag, "releaseCaptureResources: encoder release failed: ${e.message}")
+            }
+        }
+        videoEncoder = null
+        try {
+            surface?.release()
+        } catch (e: Exception) {
+            Log.w(logTag, "releaseCaptureResources: surface release failed: ${e.message}")
+        }
+        surface = null
+    }
+
     fun startCapture(): Boolean {
         if (isStart && virtualDisplay != null) {
             return true  // Already capturing with a valid VirtualDisplay
         }
-        if (mediaProjection == null) {
+        // 只取一次局部快照。onStop() 跑在 serviceHandler 线程上，可能在下面任意
+        // 一步把 `mediaProjection` 置空 —— 历史版本在这里读了两遍字段并用 `!!`
+        // 解引用，于是「投影被系统撤销」升级成了进程崩溃。之后全程只用 mp。
+        val mp = mediaProjection
+        if (mp == null) {
             Log.w(logTag, "startCapture fail,mediaProjection is null")
             return false
         }
@@ -587,12 +644,28 @@ class MainService : Service() {
         } else {
             Log.d(logTag, "Retry Capture (VirtualDisplay was null)")
         }
-        surface = createSurface()
 
-        if (useVP9) {
-            startVP9VideoRecorder(mediaProjection!!)
-        } else {
-            startRawVideoRecorder(mediaProjection!!)
+        try {
+            surface = createSurface()
+            if (useVP9) {
+                startVP9VideoRecorder(mp)
+            } else {
+                startRawVideoRecorder(mp)
+            }
+        } catch (e: RuntimeException) {
+            // 快照与使用之间投影被系统撤销时（同机另一 App 抢投屏、用户在系统 UI
+            // 里停止共享），createVirtualDisplay 会抛 IllegalStateException 或
+            // NullPointerException。优雅失败并让下一次连接重新申请授权，
+            // 绝不让进程崩溃。
+            Log.e(
+                logTag,
+                "startCapture aborted, projection became invalid: " +
+                    "${e.javaClass.simpleName}: ${e.message}"
+            )
+            FFI.setFrameRawEnable("video", false)
+            // invalidateProjection() 内部会强制释放挂在死投影上的采集资源
+            invalidateProjection()
+            return false
         }
 
         // Only mark capture active after both the projection surface and the
@@ -602,16 +675,13 @@ class MainService : Service() {
         if (!ok) {
             Log.e(logTag, "startCapture failed to create video surface/virtual display")
             FFI.setFrameRawEnable("video", false)
-            imageReader?.close()
-            imageReader = null
-            surface?.release()
-            surface = null
+            releaseCaptureResources(forceReleaseDisplay = true)
             return false
         }
         _isStart = true
         FFI.setFrameRawEnable("video", true)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            if (!audioRecordHandle.createAudioRecorder(false, mediaProjection)) {
+            if (!audioRecordHandle.createAudioRecorder(false, mp)) {
                 Log.d(logTag, "createAudioRecorder fail")
             } else {
                 Log.d(logTag, "audio recorder start")
@@ -763,10 +833,26 @@ class MainService : Service() {
         } catch (e: SecurityException) {
             Log.w(logTag, "createOrSetVirtualDisplay: got SecurityException, invalidating projection");
             invalidateProjection()
+        } catch (e: IllegalStateException) {
+            // 投影在 createVirtualDisplay 期间被系统停掉（同机另一 App 抢投屏、
+            // 用户从系统 UI 停止共享）。按「投影已失效」处理，交给上层优雅失败，
+            // 不要让异常冒到 ActivityThread 变成进程崩溃。
+            Log.w(
+                logTag,
+                "createOrSetVirtualDisplay: projection no longer valid " +
+                    "(${e.message}), invalidating projection"
+            )
+            invalidateProjection()
+        } catch (e: NullPointerException) {
+            // 少数 ROM 在投影已撤销时直接从 createVirtualDisplay 内部抛 NPE。
+            Log.w(logTag, "createOrSetVirtualDisplay: NPE from a dead projection, invalidating")
+            invalidateProjection()
         }
     }
 
-    /// Clear the stale MediaProjection without prompting the user again.
+    /// Clear the dead MediaProjection without prompting the user again.
+    /// 之后 `ensureCaptureStarted()` 会看到 `mediaProjection == null`，
+    /// 于是下一次被控连接走一次系统授权，而不是反复重试一个已死的投影。
     private fun invalidateProjection() {
         try {
             mediaProjection?.unregisterCallback(projectionCallback)
@@ -775,87 +861,33 @@ class MainService : Service() {
         mediaProjection = null
         _isReady = false
         _isStart = false
-        // The token can no longer create a VirtualDisplay; drop it so the next
-        // connection goes through a fresh authorization instead of retrying a
-        // dead grant every time.
-        clearProjectionToken()
+        // 投影已经死了：把挂在它上面的 VirtualDisplay / Surface 一并拆干净，
+        // 否则下一次 startCapture 会复用一个失效的虚拟屏（永久黑屏）。
+        releaseCaptureResources(forceReleaseDisplay = true)
         checkMediaPermission()
     }
 
     // ------------------------------------------------------------------
-    // Persisted MediaProjection token ("remember the screen-capture grant")
+    // 关于「记住投屏授权」的说明（2026-09-11 结论）
     // ------------------------------------------------------------------
-
-    /// Persist the grant result data so a later process lifetime can restore it.
-    /// The token stays valid until the OS revokes it; stale tokens are detected
-    /// on restore and cleared, so we never retry a dead grant in a loop.
-    private fun saveProjectionToken(resultData: Intent) {
-        try {
-            val data = resultData.data?.toString()
-            if (!data.isNullOrEmpty()) {
-                applicationContext.getSharedPreferences(KEY_SHARED_PREFERENCES, MODE_PRIVATE)
-                    .edit()
-                    .putString(KEY_MEDIA_PROJECTION_TOKEN, data)
-                    .apply()
-                Log.d(logTag, "saveProjectionToken: persisted screen-capture grant")
-            } else {
-                // Some OEM MediaProjection results carry the token in extras
-                // instead of data; keep it visible in logs so a device that
-                // "never remembers" the grant can be diagnosed.
-                Log.w(logTag, "saveProjectionToken: result intent has no data Uri, grant cannot be persisted")
-            }
-        } catch (e: Exception) {
-            Log.w(logTag, "saveProjectionToken failed: ${e.message}")
-        }
-    }
-
-    private fun clearProjectionToken() {
-        try {
-            applicationContext.getSharedPreferences(KEY_SHARED_PREFERENCES, MODE_PRIVATE)
-                .edit()
-                .remove(KEY_MEDIA_PROJECTION_TOKEN)
-                .apply()
-        } catch (e: Exception) {
-            Log.w(logTag, "clearProjectionToken failed: ${e.message}")
-        }
-    }
-
-    /// Rebuild the MediaProjection from a previously persisted grant.
-    /// Returns true when a still-valid projection was restored; false when
-    /// there is no persisted token or the system revoked it (token cleared).
-    private fun restoreProjectionToken(): Boolean {
-        if (mediaProjection != null && isReady) return true
-        val tokenData = try {
-            applicationContext.getSharedPreferences(KEY_SHARED_PREFERENCES, MODE_PRIVATE)
-                .getString(KEY_MEDIA_PROJECTION_TOKEN, null)
-        } catch (e: Exception) {
-            Log.w(logTag, "readProjectionToken failed: ${e.message}")
-            null
-        }
-        if (tokenData.isNullOrEmpty()) return false
-        return try {
-            val mediaProjectionManager =
-                getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            val restoreIntent = Intent().apply { setData(Uri.parse(tokenData)) }
-            val mp = mediaProjectionManager.getMediaProjection(Activity.RESULT_OK, restoreIntent)
-            if (mp == null) {
-                Log.w(logTag, "restoreProjectionToken: token no longer valid, clearing")
-                clearProjectionToken()
-                false
-            } else {
-                mediaProjection = mp
-                mediaProjection?.registerCallback(projectionCallback, serviceHandler)
-                _isReady = true
-                checkMediaPermission()
-                Log.d(logTag, "restoreProjectionToken: restored previously granted projection")
-                true
-            }
-        } catch (e: Exception) {
-            Log.w(logTag, "restoreProjectionToken: restore failed (${e.message}), clearing")
-            clearProjectionToken()
-            false
-        }
-    }
+    //
+    // 历史上这里实现过一套 saveProjectionToken / restoreProjectionToken：
+    // 把授权结果 Intent 的 `data` Uri 存进 SharedPreferences，进程重建后
+    // 用 `Intent().setData(uri)` + `getMediaProjection(RESULT_OK, ...)` 复原，
+    // 以做到「授权一次，永久免弹窗」。
+    //
+    // 实测（华为 GNH0222922000982，Android 12 / EMUI，2.2.38）证明这条路走不通：
+    //     W/LOG_SERVICE: saveProjectionToken: result intent has no data Uri,
+    //                    grant cannot be persisted
+    // 系统给回的结果 Intent 里根本没有 `data`，令牌是一个 IBinder（无法序列化落盘），
+    // 因此这段代码从未成功保存过任何东西，`restoreProjectionToken()` 永远返回 false。
+    // 保留它只会误导后来人以为存在跨进程复用，故整体删除。
+    //
+    // 正确的行为边界：
+    //   * 进程存活期间 → 复用同一个 MediaProjection，被控连接**不弹窗**
+    //     （见 ensureCaptureStarted / stopCapture：停采集不销毁投影）；
+    //   * 进程被系统回收 / 投影被系统撤销 → 下一次连接**必须重新授权一次**。
+    //     这是 Android 平台约束，不是缺陷。
 
     private val cb: MediaCodec.Callback = object : MediaCodec.Callback() {
         override fun onInputBufferAvailable(codec: MediaCodec, index: Int) {}
