@@ -267,6 +267,9 @@ class FfiModel with ChangeNotifier {
     _inputBlocked = false;
     _timer?.cancel();
     _timer = null;
+    // LUODA: 用户退出会话页（FFI.close -> ffiModel.clear）时收掉自动重连看门狗，
+    // 避免页面已经销毁还在后台反复重连。
+    stopLinkLostWatchdog('model clear');
     clearPermissions();
     waitForImageTimer?.cancel();
     waitForImageAutoDismissTimer?.cancel();
