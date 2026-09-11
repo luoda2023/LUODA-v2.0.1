@@ -115,6 +115,12 @@ const SWEEP_HOST_LIMIT: usize = 254;
 /// 连接前的补发现不受此限——那次如果扫不到，这次连接就一定失败。
 const SWEEP_MIN_INTERVAL: Duration = Duration::from_secs(45);
 
+/// `lan-sweep-subnets` 允许的额外网段数量上限。
+///
+/// 这是个手工配置项，正常只会填 1~2 个；设上限是为了防止把整份网段表粘进来
+/// （或写错成 `0.0.0.0/0`）时，一轮发现里瞬间打出上万条 UDP。
+const EXTRA_SWEEP_SUBNET_LIMIT: usize = 8;
+
 /// 与 `direct_access::lan_candidate_score` 保持同一份名单：这些网卡是
 /// VPN / 虚拟机 / 隧道，扫它们的网段既找不到被控端也白费流量。
 const VIRTUAL_IFACE_MARKERS: [&str; 21] = [
@@ -165,16 +171,88 @@ fn build_ping_packet() -> ResultType<Vec<u8>> {
     Ok(msg_out.write_to_bytes()?)
 }
 
+/// 读取本地配置 `lan-sweep-subnets`：除自己所在网段外，**额外**要单播扫描的网段。
+///
+/// 场景：两台设备挂在不同路由器后面、不共享二层广播域，但上联设备互相可达
+/// （PC 在 `192.168.31.0/24`、手机在 `192.168.1.0/24`）。此时广播发现必然空手
+/// 而归（广播不出路由器），而对端网段的**单播**探测仍然能到，配上对端的
+/// `lan_peer_hosts` 命中就能建立局域网直连，不必退回中继。
+///
+/// 留空（默认）→ 不产生任何额外流量，行为与没有这个开关时完全一致。
+/// 这里不做任何猜测性扫描：只有用户明确知道对端在哪个网段时才填。
+fn extra_sweep_subnets() -> Vec<(Ipv4Addr, u32)> {
+    parse_sweep_subnets(&config::LocalConfig::get_option("lan-sweep-subnets"))
+}
+
+/// 解析 `lan-sweep-subnets`：`地址/前缀长度` 列表，逗号 / 分号 / 空白分隔。
+///
+/// 容忍并跳过非法项（只 log 一行 warn），因为这一项可能被手写进配置文件，
+/// 一个错字不该让整个局域网发现能力失效。
+fn parse_sweep_subnets(raw: &str) -> Vec<(Ipv4Addr, u32)> {
+    let mut out = Vec::new();
+    for token in raw.split(|c: char| c == ',' || c == ';' || c.is_whitespace()) {
+        if out.len() >= EXTRA_SWEEP_SUBNET_LIMIT {
+            log::warn!(
+                "lan-sweep-subnets: 超出 {EXTRA_SWEEP_SUBNET_LIMIT} 个网段上限，其余忽略"
+            );
+            break;
+        }
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let Some((addr, prefix)) = token.split_once('/') else {
+            log::warn!("lan-sweep-subnets: 忽略缺少前缀长度的项 `{token}`");
+            continue;
+        };
+        // 前缀收到 [8, 30]：比 /8 还宽等于扫全网、比 /30 还窄只剩 1~2 个地址，
+        // 都不该由这一项来表达（/31、/32 更是没有可扫的主机位）。
+        let parsed = addr
+            .trim()
+            .parse::<Ipv4Addr>()
+            .ok()
+            .zip(prefix.trim().parse::<u32>().ok())
+            .filter(|(_, prefix)| (8..=30).contains(prefix));
+        match parsed {
+            Some((addr, prefix)) => out.push((addr, prefix)),
+            None => log::warn!("lan-sweep-subnets: 忽略无法解析的项 `{token}`"),
+        }
+    }
+    out
+}
+
+/// 把 `(网段基址, 前缀长度)` 展开成该网段内待探测的主机地址列表（最多 /24 个）。
+fn sweep_targets_in(network_addr: Ipv4Addr, prefix_len: u32) -> Vec<Ipv4Addr> {
+    let mask = (!0u32) << (32 - prefix_len);
+    let network = u32::from(network_addr) & mask;
+    let broadcast = network | !mask;
+
+    let mut targets = Vec::new();
+    let mut cur = network.saturating_add(1);
+    while cur < broadcast && targets.len() < SWEEP_HOST_LIMIT {
+        targets.push(Ipv4Addr::from(cur));
+        cur = cur.saturating_add(1);
+    }
+    targets
+}
+
 /// 生成本地各私有网段的「单播扫描计划」：`(本网卡地址, 该网段内待探测的主机)`。
 ///
 /// 配对返回而不是摊平成一个地址列表：`send_to` 必须走绑定在该网卡上的
 /// socket，否则多网卡机器会把 A 网段的包从 B 网卡（默认路由）发出去。
+///
+/// `0.0.0.0` 作为「本网卡地址」是合法取值，含义是交给路由表选出口——
+/// 只用于 `extra_sweep_subnets` 里那种**已知在对端网段**的目标。
 fn unicast_sweep_plan() -> Vec<(Ipv4Addr, Vec<Ipv4Addr>)> {
     // iOS 上 `default_net::get_interfaces()` 会引发 undefined symbol（见
     // `create_broadcast_sockets` 里的说明），所以整个枚举块被 cfg 掉，
     // 此时 `plan` 不需要 mut。
     #[allow(unused_mut)]
     let mut plan: Vec<(Ipv4Addr, Vec<Ipv4Addr>)> = Vec::new();
+    // 已经覆盖的网段（网络号），用于给 `extra_sweep_subnets` 去重：
+    // 用户把本机网段也填进去时，不该再扫一遍。
+    #[allow(unused_mut)]
+    let mut covered: Vec<u32> = Vec::new();
 
     #[cfg(not(target_os = "ios"))]
     for interface in default_net::get_interfaces() {
@@ -190,22 +268,28 @@ fn unicast_sweep_plan() -> Vec<(Ipv4Addr, Vec<Ipv4Addr>)> {
             }
             // 收敛到 /24：比 /24 宽的按 /24 裁剪，比 /24 窄的按实际范围来。
             let prefix = u32::from(ipv4.prefix_len.clamp(24, 30));
-            let mask = (!0u32) << (32 - prefix);
-            let network = u32::from(host) & mask;
-            let broadcast = network | !mask;
-
-            let mut targets = Vec::new();
-            let mut cur = network.saturating_add(1);
-            while cur < broadcast && targets.len() < SWEEP_HOST_LIMIT {
-                let candidate = Ipv4Addr::from(cur);
-                if candidate != host {
-                    targets.push(candidate);
-                }
-                cur = cur.saturating_add(1);
-            }
+            let network = u32::from(host) & ((!0u32) << (32 - prefix));
+            let mut targets = sweep_targets_in(host, prefix);
+            // 自己那个地址不用探。
+            targets.retain(|candidate| *candidate != host);
             if !targets.is_empty() {
+                covered.push(network);
                 plan.push((host, targets));
             }
+        }
+    }
+
+    // 额外网段：见 `extra_sweep_subnets`。绑定 `0.0.0.0` 让内核按路由表选出口。
+    for (addr, prefix) in extra_sweep_subnets() {
+        let prefix = prefix.clamp(8, 30);
+        let network = u32::from(addr) & ((!0u32) << (32 - prefix));
+        if covered.contains(&network) {
+            continue;
+        }
+        let targets = sweep_targets_in(addr, prefix);
+        if !targets.is_empty() {
+            covered.push(network);
+            plan.push((Ipv4Addr::UNSPECIFIED, targets));
         }
     }
 
@@ -548,4 +632,72 @@ async fn handle_received_peers(
     #[cfg(feature = "flutter")]
     crate::flutter_ffi::main_load_lan_peers();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sweep_subnets_parses_common_forms() {
+        let got = parse_sweep_subnets("192.168.1.0/24, 10.0.0.0/16;172.16.5.0/24");
+        assert_eq!(
+            got,
+            vec![
+                (Ipv4Addr::new(192, 168, 1, 0), 24),
+                (Ipv4Addr::new(10, 0, 0, 0), 16),
+                (Ipv4Addr::new(172, 16, 5, 0), 24),
+            ]
+        );
+    }
+
+    #[test]
+    fn sweep_subnets_skips_garbage_without_losing_the_rest() {
+        // 手写配置项，一个错字不该让整份配置作废。
+        let got = parse_sweep_subnets("192.168.1.0/24, oops, 10.0.0.0, 192.168.2.0/33,10.1.0.0/24");
+        assert_eq!(
+            got,
+            vec![
+                (Ipv4Addr::new(192, 168, 1, 0), 24),
+                (Ipv4Addr::new(10, 1, 0, 0), 24),
+            ]
+        );
+    }
+
+    #[test]
+    fn sweep_subnets_empty_by_default_and_capped() {
+        assert!(parse_sweep_subnets("").is_empty());
+        assert!(parse_sweep_subnets("   ").is_empty());
+        // 上限：多余的直接丢弃，不会把一轮发现变成扫描器。
+        let many = (0..20)
+            .map(|i| format!("10.{i}.0.0/24"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(parse_sweep_subnets(&many).len(), EXTRA_SWEEP_SUBNET_LIMIT);
+    }
+
+    #[test]
+    fn sweep_targets_are_bounded_and_exclude_network_and_broadcast() {
+        let targets = sweep_targets_in(Ipv4Addr::new(192, 168, 1, 99), 24);
+        assert_eq!(targets.len(), 254);
+        assert_eq!(targets.first().unwrap(), &Ipv4Addr::new(192, 168, 1, 1));
+        assert_eq!(targets.last().unwrap(), &Ipv4Addr::new(192, 168, 1, 254));
+        // 比 /24 宽也按 /24 收敛。
+        assert_eq!(sweep_targets_in(Ipv4Addr::new(10, 0, 0, 7), 16).len(), 254);
+        // /30 只有 2 个可用主机位。
+        assert_eq!(
+            sweep_targets_in(Ipv4Addr::new(10, 0, 0, 4), 30),
+            vec![Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(10, 0, 0, 6)]
+        );
+    }
+
+    /// `lan-sweep-subnets` 是显式开关：无论配置成什么，展开结果都必须有界且合法，
+    /// 未配置时为空（本机/CI 都不会配置这一项）。
+    #[test]
+    fn extra_sweep_subnets_is_bounded() {
+        let got = extra_sweep_subnets();
+        assert!(got.len() <= EXTRA_SWEEP_SUBNET_LIMIT);
+        assert!(got.iter().all(|(_, prefix)| (8..=30).contains(prefix)));
+        assert!(parse_sweep_subnets("").is_empty());
+    }
 }

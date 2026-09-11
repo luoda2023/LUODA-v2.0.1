@@ -976,6 +976,23 @@ class FfiModel with ChangeNotifier {
     } else if (type == 'elevation-error') {
       showElevationError(sessionId, type, title, text, dialogManager);
     } else if (type == 'relay-hint' || type == 'relay-hint2') {
+      // LUODA: relay-hint / relay-hint2 必须同样纳入自动重连看门狗。
+      //
+      // Rust 侧 `on_establish_connection_error`：当**直连已经建立过**、随后连接被
+      // 对端 reset（`direct == Some(true)` 且 errno == 104 / errno == 10054）时，
+      // 优先发的是 `relay-hint`（收到过数据）或 `relay-hint2`（没收到过），
+      // 而**不是**普通的 `error`。也就是说：**「对端进程重启/登出」这个最常见的
+      // 断线场景，天然落在 relay-hint 上**。
+      //
+      // 这两个 type 原来在 handleMsgBox 里走独立分支、直接 return，完全绕开下面
+      // else 里的 startLinkLostWatchdog —— 实测后果是：PC 端 LDesk 被重启后，手机
+      // 侧 200 秒内一次重连都不发起（logcat 零 `[LUODA-RC]`、Rust 日志零
+      // `Direct connection to`），只能用户手点「再试」。
+      //
+      // 窗口取对端侧 120s（覆盖「对端重启 → 重新注册 → 重新监听 21118」实测
+      // 60~90s）；退避走 1/2/4/8/16/30…，最多约 7 次就自行停止，不会无限重试。
+      // 用户仍可随时手点「中继连接」立刻改走中继。
+      startLinkLostWatchdog(text, _kPeerOfflineMaxWindowSeconds);
       showRelayHintDialog(sessionId, type, title, text, dialogManager, peerId);
     } else if (text == kMsgboxTextWaitingForImage) {
       // LUODA: 走到这里说明对端已经认下这次会话，重连成功。
