@@ -145,28 +145,29 @@ jobs:
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --version 2.11.0 --locked
 
-      - name: Setup opus headers for Android build
+      # ------------------------------------------------------------------
+      # ⚠️ 绝对不要再用 opus `master` / libvpx `main` 的头文件覆盖 vcpkg 的头文件。
+      #
+      # opus 与 libvpx 都是「编译期常量 + 运行期校验」的 ABI 模型：
+      #   libvpx: VPX_ENCODER_ABI_VERSION = 18 + VPX_CODEC_ABI_VERSION + VPX_EXT_RATECTRL_ABI_VERSION
+      #           其中 VPX_CODEC_ABI_VERSION      = 4 + VPX_IMAGE_ABI_VERSION
+      #                VPX_EXT_RATECTRL_ABI_VERSION = 7 + VPX_TPL_ABI_VERSION
+      #
+      # 实测事故（2026-09-11，华为 ABR-AL80 / OPPO PFUM10）：
+      #   头文件取 main  → VPX_TPL_ABI_VERSION = 5 → VPX_ENCODER_ABI_VERSION = 18+9+12 = 39
+      #   链接 vcpkg 的 libvpx 1.15.2 → 库内 ABI 为 38
+      #   → vpx_codec_enc_init_ver() 恒返回 VPX_CODEC_ABI_MISMATCH(errcode=3)
+      #   → Android 被控端一帧都编不出来，主控端「一直显示已连接、画面全黑」
+      #     （设备日志：ERROR src/server/video_service.rs:623 Failed to create encoder:
+      #      FailedCall("errcode=3 ... vpxcodec.rs:108:17"), fallback to VP9，每秒重试一次）
+      #
+      # 唯一正确做法：头文件与库来自同一次 vcpkg 安装。实际的 include 路径在下方
+      # 「Build Rust library for Android」步骤里按 triplet 解析。
+      # ------------------------------------------------------------------
+      - name: Drop rolling-branch third-party header overrides
         run: |
-          OPUS_INCLUDE=$(pwd)/target/opus-include/opus
-          mkdir -p $OPUS_INCLUDE
-          wget -q https://raw.githubusercontent.com/xiph/opus/master/include/opus.h -O $OPUS_INCLUDE/opus.h
-          wget -q https://raw.githubusercontent.com/xiph/opus/master/include/opus_multistream.h -O $OPUS_INCLUDE/opus_multistream.h
-          wget -q https://raw.githubusercontent.com/xiph/opus/master/include/opus_defines.h -O $OPUS_INCLUDE/opus_defines.h
-          wget -q https://raw.githubusercontent.com/xiph/opus/master/include/opus_types.h -O $OPUS_INCLUDE/opus_types.h
-          wget -q https://raw.githubusercontent.com/xiph/opus/master/include/opus_projection.h -O $OPUS_INCLUDE/opus_projection.h
-          ls -la $OPUS_INCLUDE/
-          echo "OPUS_INCLUDE_PATH=$(pwd)/target/opus-include" >> $GITHUB_ENV
-
-      - name: Setup vpx headers for Android build
-        run: |
-          VPX_INCLUDE=$(pwd)/target/vpx-include/vpx
-          mkdir -p $VPX_INCLUDE
-          BASE_URL="https://raw.githubusercontent.com/webmproject/libvpx/main/vpx"
-          for f in vp8.h vp8cx.h vp8dx.h vpx_codec.h vpx_decoder.h vpx_encoder.h vpx_image.h vpx_integer.h vpx_ext_ratectrl.h vpx_tpl.h vpx_frame_buffer.h; do
-            wget -q "$BASE_URL/$f" -O "$VPX_INCLUDE/$f" || echo "WARN: failed to download $f"
-          done
-          ls -la $VPX_INCLUDE/
-          echo "VPX_INCLUDE_PATH=$(pwd)/target/vpx-include" >> $GITHUB_ENV
+          rm -rf target/vpx-include target/opus-include
+          echo "OK: removed rolling-branch header overrides; vcpkg headers will be used"
 
       - name: Register rustls-platform-verifier maven repo
         run: |
@@ -226,8 +227,7 @@ jobs:
           NDK=${{ steps.setup-ndk.outputs.ndk-path }}
           VCPKG=${{ env.VCPKG_ROOT }}
           OUT=flutter/android/app/src/main/jniLibs
-          OPUS_INCLUDE=${{ env.OPUS_INCLUDE_PATH }}
-          VPX_INCLUDE=${{ env.VPX_INCLUDE_PATH }}
+          # OPUS_INCLUDE / VPX_INCLUDE 按 triplet 在循环内解析（必须与链接的 vcpkg 库同源）
 
           for TARGET_ABI in armeabi-v7a arm64-v8a x86_64; do
             case $TARGET_ABI in
@@ -266,6 +266,57 @@ jobs:
               fi
               sleep 15
             done
+
+            # ---- 头文件必须与本次实际链接的 vcpkg 库同源 ----
+            # （原因见上方 "Drop rolling-branch third-party header overrides" 步骤）
+            VCPKG_TRIPLET_INCLUDE="$VCPKG/installed/$VCPKG_TRIPLET/include"
+            OPUS_INCLUDE="$VCPKG_TRIPLET_INCLUDE"
+            VPX_INCLUDE="$VCPKG_TRIPLET_INCLUDE"
+            if [ ! -f "$VPX_INCLUDE/vpx/vpx_encoder.h" ]; then
+              echo "ERROR: $VPX_INCLUDE/vpx/vpx_encoder.h missing."
+              echo "       Refusing to build: a hand-rolled header set here is exactly what"
+              echo "       produced errcode=3 (VPX_CODEC_ABI_MISMATCH) and a black screen."
+              exit 1
+            fi
+            echo "third-party include root: $VPX_INCLUDE"
+
+            # ---- ABI 端到端校验 ----
+            # 用「将参与编译的这份头文件」+ vcpkg host 库真正调一次 vpx_codec_enc_init_ver()。
+            # ABI 号对不上时它会返回 VPX_CODEC_ABI_MISMATCH(=3) —— 宁可构建失败，
+            # 也不能再产出一个「能连上但画面全黑」的 APK。
+            {
+              echo '#include <vpx/vpx_encoder.h>'
+              echo '#include <vpx/vp8cx.h>'
+              echo '#include <stdio.h>'
+              echo 'int main(void) {'
+              echo '  vpx_codec_iface_t *iface = vpx_codec_vp9_cx();'
+              echo '  vpx_codec_enc_cfg_t cfg;'
+              echo '  vpx_codec_ctx_t ctx;'
+              echo '  vpx_codec_err_t e;'
+              echo '  printf("VPX_ENCODER_ABI_VERSION=%d\n", VPX_ENCODER_ABI_VERSION);'
+              echo '  if (vpx_codec_enc_config_default(iface, &cfg, 0) != VPX_CODEC_OK) {'
+              echo '    printf("enc_config_default failed\n"); return 2; }'
+              echo '  cfg.g_w = 640; cfg.g_h = 480;'
+              echo '  cfg.g_timebase.num = 1; cfg.g_timebase.den = 30;'
+              echo '  e = vpx_codec_enc_init_ver(&ctx, iface, &cfg, 0, VPX_ENCODER_ABI_VERSION);'
+              echo '  printf("vpx_codec_enc_init_ver=%d (ABI_MISMATCH=%d)\n", (int)e, (int)VPX_CODEC_ABI_MISMATCH);'
+              echo '  return (e == VPX_CODEC_ABI_MISMATCH) ? 3 : 0;'
+              echo '}'
+            } > /tmp/vpxabi_check.c
+            HOST_LIB="$VCPKG/installed/x64-linux/lib/libvpx.a"
+            if [ ! -f "$HOST_LIB" ]; then
+              echo "WARN: $HOST_LIB not found, skipping vpx ABI link check"
+            elif cc -I"$VPX_INCLUDE" /tmp/vpxabi_check.c "$HOST_LIB" \
+                   -lpthread -lm -ldl -o /tmp/vpxabi_check 2>/tmp/vpxabi_check.err; then
+              if ! /tmp/vpxabi_check; then
+                echo "ERROR: vpx ABI mismatch verified at build time."
+                echo "       The header set passed as -I does not match the libvpx being linked."
+                exit 1
+              fi
+            else
+              echo "WARN: vpx ABI link check skipped (probe failed to build):"
+              head -5 /tmp/vpxabi_check.err
+            fi
 
             VCPKG_INCLUDE_FLAG=""
             if [ -d "$VCPKG/installed/$VCPKG_TRIPLET/include" ]; then

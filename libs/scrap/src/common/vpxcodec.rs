@@ -20,6 +20,40 @@ use std::{ptr, slice};
 generate_call_macro!(call_vpx, false);
 generate_call_ptr_macro!(call_vpx_ptr);
 
+/// 把 `vpx_codec_err_t` 取成整数：bindgen 生成的是 fieldless enum，
+/// 直接和 0 比较要依赖它是否实现了 PartialEq，统一走整数最稳。
+fn vpx_err_code(err: vpx_codec_err_t) -> i32 {
+    unsafe { std::mem::transmute::<vpx_codec_err_t, i32>(err) }
+}
+
+/// 把 vpx 初始化失败翻译成能直接定位问题的一句话。
+///
+/// 重点是 `VPX_CODEC_ABI_MISMATCH`。libvpx 用「编译期写死的 ABI 常量 + 运行期校验」
+/// 来保证二进制兼容：
+///   `VPX_ENCODER_ABI_VERSION = 18 + VPX_CODEC_ABI_VERSION + VPX_EXT_RATECTRL_ABI_VERSION`
+/// 只要任一组成部分（例如 `VPX_TPL_ABI_VERSION`）在「参与编译的头文件」与「实际链接的
+/// libvpx 库」之间不一致，初始化就会直接失败。症状极具误导性：连接、鉴权、编解码协商
+/// 全部正常，只是**一帧都编不出来**，主控端表现为「一直显示已连接，但画面全黑」。
+///
+/// 2026-09-11 实测事故（Android 被控端全平台黑屏）正是这个原因：CI 从头文件
+/// `libvpx/main` 取头文件、却链接 vcpkg 里固定的 libvpx 1.15.2，编出来的 ABI 号是 39
+/// 而库里是 38，`vpx_codec_enc_init_ver` 恒返回 errcode=3。旧代码只留下 `errcode=3`
+/// 这一行日志，完全无法反推。因此这里把编译期 ABI 号一并打出来。
+/// 相关构建约束见 `.github/workflows/build-apk.yml` 顶部说明。
+fn vpx_init_failure_message(func: &str, err: vpx_codec_err_t, compiled_abi: i32) -> String {
+    let code = vpx_err_code(err);
+    if code == vpx_err_code(VPX_CODEC_ABI_MISMATCH) {
+        format!(
+            "{func} failed: VPX_CODEC_ABI_MISMATCH (errcode={code}). \
+             This binary was compiled against ABI version {compiled_abi}, which the linked \
+             libvpx rejects. The vpx/*.h headers and the libvpx library MUST come from the \
+             same libvpx release."
+        )
+    } else {
+        format!("{func} failed: errcode={code}")
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum VpxVideoCodecId {
     VP8,
@@ -105,13 +139,19 @@ impl EncoderApi for VpxEncoder {
                 */
 
                 let mut ctx = Default::default();
-                call_vpx!(vpx_codec_enc_init_ver(
-                    &mut ctx,
-                    i,
-                    &c,
-                    0,
-                    VPX_ENCODER_ABI_VERSION as _
-                ));
+                // 刻意不用 `call_vpx!`：它只会留下 `errcode=3`，看不出是 ABI 不匹配。
+                // 详见 vpx_init_failure_message() 的说明。
+                let enc_rc = unsafe {
+                    vpx_codec_enc_init_ver(&mut ctx, i, &c, 0, VPX_ENCODER_ABI_VERSION as _)
+                };
+                if vpx_err_code(enc_rc) != 0 {
+                    return Err(Error::FailedCall(vpx_init_failure_message(
+                        "vpx_codec_enc_init_ver",
+                        enc_rc,
+                        VPX_ENCODER_ABI_VERSION as i32,
+                    ))
+                    .into());
+                }
 
                 if config.codec == VpxVideoCodecId::VP9 {
                     // set encoder internal speed settings
@@ -458,13 +498,17 @@ impl VpxDecoder {
             println!("{}", vpx_codec_get_caps(i));
         }
         */
-        call_vpx!(vpx_codec_dec_init_ver(
-            &mut ctx,
-            i,
-            &cfg,
-            0,
-            VPX_DECODER_ABI_VERSION as _,
-        ));
+        // 同 vpx_init_failure_message()：解码器初始化也要能一眼看出 ABI 不匹配。
+        let dec_rc =
+            unsafe { vpx_codec_dec_init_ver(&mut ctx, i, &cfg, 0, VPX_DECODER_ABI_VERSION as _) };
+        if vpx_err_code(dec_rc) != 0 {
+            return Err(Error::FailedCall(vpx_init_failure_message(
+                "vpx_codec_dec_init_ver",
+                dec_rc,
+                VPX_DECODER_ABI_VERSION as i32,
+            ))
+            .into());
+        }
         Ok(Self { ctx })
     }
 
