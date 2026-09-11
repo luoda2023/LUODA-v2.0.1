@@ -126,12 +126,20 @@ class FfiModel with ChangeNotifier {
   Timer? _linkLostWatchdog;
   bool _linkLostReconnecting = false;
   int _linkLostDelay = 1;
+  int _linkLostWindow = _kLinkLostMaxWindowSeconds;
   DateTime? _linkLostStart;
   DateTime? _linkLostLastAttempt;
   String _linkLostReason = '';
 
   /// 看门狗最多自愈多久（秒）。超时后不再自动重连，交给用户手动处理。
   static const int _kLinkLostMaxWindowSeconds = 300;
+
+  /// 对端侧原因（对端进程重启 / 登出 / reset，典型是 `os error 104`）的自愈窗口。
+  ///
+  /// 比链路抖动短，但要覆盖"对端重启→重新注册→可被连上"的整个过程：
+  /// 实测对端便携版重启到重新监听 21118 约 60~90 秒，旧的 30 秒窗口刚好够不着，
+  /// 于是手机上看到 `Connection reset by peer (104)` 之后再也回不来。
+  static const int _kPeerOfflineMaxWindowSeconds = 120;
 
   /// 看门狗退避上限（秒）。链路抖动恢复时间不可预知，退避封顶在这个值，
   /// 保证网络一恢复，最多 30 秒内一定能撞上一次重连。
@@ -979,15 +987,21 @@ class FfiModel with ChangeNotifier {
           sessionId, type, title, text, link, hasRetry, dialogManager);
     } else {
       var hasRetry = evt['hasRetry'] == 'true';
-      if (isLinkLostError(title, text)) {
-        // LUODA: 本机链路抖动（AP 漫游 / Wi-Fi 被系统掐断）导致的掉线。
-        // 这类掉线必须自动重连，但**不能**依赖"这条 msgbox 送达 UI"来推进重连
-        // 链——实测第二次失败的 msgbox 没能驱动后续重连，退避链就此断掉。
-        // 改用与会话事件流解耦的看门狗来驱动，msgbox 只负责把界面显示出来。
-        hasRetry = true;
-        startLinkLostWatchdog(text);
-      } else if (!hasRetry) {
-        hasRetry = shouldAutoRetryOnOffline(type, title, text);
+      final linkLost = isLinkLostError(title, text);
+      if (!hasRetry) {
+        hasRetry = linkLost || shouldAutoRetryOnOffline(type, title, text);
+      }
+      if (hasRetry && title == 'Connection Error') {
+        // LUODA: 所有"值得自动重连"的连接错误都由看门狗驱动，**不能**依赖
+        // "这条 msgbox 送达 UI"来推进重连链 —— 实测第二条失败的 msgbox 没能驱动
+        // 后续重连，退避链就此断掉，网络/对端恢复后也再也不回来。
+        //
+        // 两类分开给窗口：
+        //  · 本机链路抖动（103/101/DNS/直连失败）→ 300s，要等 Wi-Fi 漫游回得来；
+        //  · 对端侧原因（104 reset / offline / peer 重启）→ 120s，覆盖对端重启到
+        //    重新监听 21118 的 60~90 秒（旧的 30s 窗口刚好够不着）。
+        startLinkLostWatchdog(text,
+            linkLost ? _kLinkLostMaxWindowSeconds : _kPeerOfflineMaxWindowSeconds);
       }
       showMsgBox(sessionId, type, title, text, link, hasRetry, dialogManager);
     }
@@ -1018,15 +1032,24 @@ class FfiModel with ChangeNotifier {
   OverlayDialogManager? get _sessionDialogManager =>
       parent.target?.dialogManager;
 
-  /// 启动/续接链路抖动看门狗。已经在跑就只更新原因，不重置退避。
-  void startLinkLostWatchdog(String reason) {
+  /// 启动/续接自动重连看门狗。已经在跑就只更新原因与窗口（窗口取更宽的那个），
+  /// 不重置退避 —— 退避必须跨多条 msgbox 连续累积，否则会一直卡在 1 秒。
+  void startLinkLostWatchdog(String reason, [int? windowSeconds]) {
     _linkLostReason = reason;
-    if (_linkLostReconnecting) return;
+    final window = windowSeconds ?? _kLinkLostMaxWindowSeconds;
+    if (_linkLostReconnecting) {
+      if (window > _linkLostWindow) {
+        _linkLostWindow = window;
+        debugPrint('[LUODA-RC] watchdog window widened to ${window}s');
+      }
+      return;
+    }
     _linkLostReconnecting = true;
+    _linkLostWindow = window;
     _linkLostDelay = 1;
     _linkLostStart = DateTime.now();
     _linkLostLastAttempt = null;
-    debugPrint('[LUODA-RC] link-lost watchdog armed, reason="$reason"');
+    debugPrint('[LUODA-RC] link-lost watchdog armed, reason="$reason", window=${window}s');
     _linkLostWatchdog?.cancel();
     _linkLostWatchdog = Timer(const Duration(seconds: 1), _linkLostWatchdogTick);
   }
@@ -1040,6 +1063,7 @@ class FfiModel with ChangeNotifier {
     _linkLostWatchdog = null;
     _linkLostReconnecting = false;
     _linkLostDelay = 1;
+    _linkLostWindow = _kLinkLostMaxWindowSeconds;
     _linkLostStart = null;
     _linkLostLastAttempt = null;
   }
@@ -1052,7 +1076,7 @@ class FfiModel with ChangeNotifier {
     if (!_linkLostReconnecting) return;
     final now = DateTime.now();
     final start = _linkLostStart;
-    if (start == null || now.difference(start).inSeconds > _kLinkLostMaxWindowSeconds) {
+    if (start == null || now.difference(start).inSeconds > _linkLostWindow) {
       stopLinkLostWatchdog('window expired');
       return;
     }
@@ -1205,7 +1229,11 @@ class FfiModel with ChangeNotifier {
       msgBox(sessionId, type, title, text, link, dialogManager,
           hasCancel: hasCancel,
           reconnect: hasRetry ? reconnect : null,
-          reconnectTimeout: hasRetry ? _reconnects : null,
+          // 看门狗在跑时，按钮上的倒计时要显示"看门狗下一次还会等多久"，
+          // 而不是早已不再推进的 _reconnects（否则永远显示 1 秒，误导用户）。
+          reconnectTimeout: hasRetry
+              ? (_linkLostReconnecting ? _linkLostDelay : _reconnects)
+              : null,
           onSubmit: onSubmit);
     }
     _timer?.cancel();
