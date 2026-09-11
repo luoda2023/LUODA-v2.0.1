@@ -352,6 +352,18 @@ jobs:
         run: python3 flutter/android/fix_plugin_agp8_compat.py
         shell: bash
 
+      # 冷启动每次都要重新下载 Gradle 分发 + AGP + 全部依赖（实测这一步就要 10 分钟），
+      # 既是长耗时来源，也是网络抖动时"配置阶段直接失败"的来源。缓存起来。
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('flutter/android/**/*.gradle', 'flutter/android/**/*.gradle.kts', 'flutter/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
       - name: Restore stable signing keystore
         env:
           LUODA_ANDROID_KEYSTORE_BASE64: ${{ secrets.LUODA_ANDROID_KEYSTORE_BASE64 }}
@@ -446,15 +458,44 @@ jobs:
         timeout-minutes: 30
         run: |
           cd flutter
+          echo "=== 构建前资源 ==="; df -h / || true; free -m || true
           flutter build apk --release --split-per-abi \
-            --build-number "$GITHUB_RUN_NUMBER"
+            --build-number "$GITHUB_RUN_NUMBER" 2>&1 | tee /tmp/apk_build.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            {
+              echo "## Build APK (split per ABI) FAILED — rc=$rc"
+              echo
+              echo '### 关键错误行'
+              echo '```'
+              grep -n -i -E "what went wrong|error|failed|exception|caused by|could not|no space|not found|denied|unresolved|cannot" /tmp/apk_build.log | tail -80 || true
+              echo '```'
+              echo
+              echo '### 日志尾部 120 行'
+              echo '```'
+              tail -120 /tmp/apk_build.log || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit "$rc"
+          fi
 
       - name: Build APK (universal)
         timeout-minutes: 15
         run: |
           cd flutter
           flutter build apk --release \
-            --build-number "$GITHUB_RUN_NUMBER"
+            --build-number "$GITHUB_RUN_NUMBER" 2>&1 | tee /tmp/apk_universal.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            {
+              echo "## Build APK (universal) FAILED — rc=$rc"
+              echo
+              echo '```'
+              tail -120 /tmp/apk_universal.log || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit "$rc"
+          fi
 
       - name: Collect APK outputs
         run: |
