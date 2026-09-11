@@ -22,8 +22,27 @@ if (localPropertiesFile.exists()) {
     localPropertiesFile.inputStream().use { reader -> localProperties.load(reader) }
 }
 
-val flutterVersionCode = localProperties.getProperty("flutter.versionCode") ?: "1"
 val flutterVersionName = localProperties.getProperty("flutter.versionName") ?: "2.0"
+
+// versionCode 由 versionName（= pubspec.yaml 的 version: X.Y.Z+N）派生，
+// 保证「APK 版本号」与「主项目版本号」一一对应、单调递增，且本地构建与 CI 一致。
+//
+// 为什么不用 local.properties 的 flutter.versionCode / CI 的 --build-number：
+// 之前 CI 传 --build-number "$GITHUB_RUN_NUMBER"，于是 versionCode 变成与版本号
+// 毫无关系的流水号（实测 v2.2.37 → 954、v2.2.40 → 2957）；而本地构建没有这个参数，
+// 会退回 local.properties 里的 1 —— 结果本地包 versionCode 远小于已装的 CI 包，
+// adb install 直接报 INSTALL_FAILED_VERSION_DOWNGRADE。
+//
+// 映射：major*1000000 + minor*10000 + patch*100
+//   2.2.40 → 2024000（> 已发布的 2957，升级路径不断）
+//   2.2.42 → 2024200
+val derivedVersionCode: Int = run {
+    val parts = flutterVersionName.split(".")
+    val major = parts.getOrNull(0)?.toIntOrNull() ?: 0
+    val minor = parts.getOrNull(1)?.toIntOrNull() ?: 0
+    val patch = parts.getOrNull(2)?.toIntOrNull() ?: 0
+    major * 1_000_000 + minor * 10_000 + patch * 100
+}
 
 fun findRustlsPlatformVerifierMavenDir(): String? {
     // The rustls-platform-verifier-android crate ships a local maven repo
@@ -135,7 +154,7 @@ android {
         applicationId = "com.luoda.remote"
         minSdkVersion(24)
         targetSdkVersion(33)
-        versionCode = flutterVersionCode.toInt()
+        versionCode = derivedVersionCode
         versionName = flutterVersionName
     }
 

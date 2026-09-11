@@ -262,10 +262,22 @@ jobs:
           # softprops/action-gh-release@v1 遇到 tag/release 已存在会直接抛
           # already_exists 失败。v2.2.33 / v2.2.35 的 EXE 就是这样反复发布失败、
           # Release 里只有 APK 没有 exe 的。
+          #
+          # ★ 必须带 --target "$GITHUB_SHA"：gh release create 不带 --target 会把 tag
+          #   建在**仓库默认分支**的 HEAD 上（本仓库默认分支是 v2.0.1），与产出这些
+          #   产物的 v2.0.1-track 代码无关 —— 这就是 v2.2.17~v2.2.40 共 23 个 tag
+          #   全部指向同一个 dac8fef9 的原因。
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "release $TAG already exists, uploading assets into it"
           else
-            gh release create "$TAG" --title "$TAG" --notes "LDesk $TAG" --latest
+            gh release create "$TAG" --title "$TAG" --notes "LDesk $TAG" --latest \
+              --target "$GITHUB_SHA"
+          fi
+          # 身份自检：tag 必须指向本次构建的提交，否则产物与 tag 对不上（不硬失败，
+          # 因为重跑一个旧 tag 是合法场景，但绝不允许静默）。
+          TAG_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/$TAG" --jq '.object.sha' 2>/dev/null || true)"
+          if [ -n "$TAG_SHA" ] && [ "$TAG_SHA" != "$GITHUB_SHA" ]; then
+            echo "::warning title=tag/产物不同源::tag $TAG 指向 $TAG_SHA，但本次构建是 $GITHUB_SHA"
           fi
 
           files=()

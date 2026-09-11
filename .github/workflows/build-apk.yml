@@ -510,8 +510,10 @@ jobs:
         run: |
           cd flutter
           echo "=== 构建前资源 ==="; df -h / || true; free -m || true
-          flutter build apk --release --split-per-abi \
-            --build-number "$GITHUB_RUN_NUMBER" 2>&1 | tee /tmp/apk_build.log
+          # 不再传 --build-number：versionCode 现由 pubspec 的 version: X.Y.Z+N 派生
+          # （见 flutter/android/app/build.gradle.kts 的 derivedVersionCode），
+          # 以保证 APK 版本号与主项目版本号一一对应。
+          flutter build apk --release --split-per-abi 2>&1 | tee /tmp/apk_build.log
           rc=${PIPESTATUS[0]}
           if [ "$rc" -ne 0 ]; then
             {
@@ -534,8 +536,8 @@ jobs:
         timeout-minutes: 15
         run: |
           cd flutter
-          flutter build apk --release \
-            --build-number "$GITHUB_RUN_NUMBER" 2>&1 | tee /tmp/apk_universal.log
+          # 同上：versionCode 由 pubspec 版本号派生，不传 --build-number。
+          flutter build apk --release 2>&1 | tee /tmp/apk_universal.log
           rc=${PIPESTATUS[0]}
           if [ "$rc" -ne 0 ]; then
             {
@@ -629,10 +631,23 @@ jobs:
           # 与 EXE 工作流共用同一个 tag。谁先跑完谁建 release，后来者复用 + clobber，
           # 不再因为 release 已存在而失败（旧 softprops/action-gh-release@v1 会抛
           # already_exists）。
+          #
+          # ★ 必须带 --target "$GITHUB_SHA"：gh release create 不带 --target 会把 tag
+          #   建在**仓库默认分支**的 HEAD 上。本仓库默认分支是 v2.0.1，而产物是在
+          #   v2.0.1-track 上编的 —— 于是 v2.2.17~v2.2.40 共 23 个 tag 全部指向
+          #   v2.0.1 的 dac8fef9，和产出它们的代码毫无关系（和 2.2.41 修的
+          #   "版本串漂移"是同一类问题：产物身份不可信）。
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "release $TAG already exists, uploading assets into it"
           else
-            gh release create "$TAG" --title "$TAG" --notes "LDesk $TAG" --latest
+            gh release create "$TAG" --title "$TAG" --notes "LDesk $TAG" --latest \
+              --target "$GITHUB_SHA"
+          fi
+          # 身份自检：tag 必须指向本次构建的提交，否则产物与 tag 对不上（不硬失败，
+          # 因为重跑一个旧 tag 是合法场景，但绝不允许静默）。
+          TAG_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/$TAG" --jq '.object.sha' 2>/dev/null || true)"
+          if [ -n "$TAG_SHA" ] && [ "$TAG_SHA" != "$GITHUB_SHA" ]; then
+            echo "::warning title=tag/产物不同源::tag $TAG 指向 $TAG_SHA，但本次构建是 $GITHUB_SHA"
           fi
           shopt -s nullglob
           files=(flutter/build/app/outputs/dist-apk/*.apk)

@@ -52,6 +52,12 @@ const val DEFAULT_NOTIFY_TEXT = "Service is running"
 const val DEFAULT_NOTIFY_ID = 1
 const val NOTIFY_ID_OFFSET = 100
 
+/// Minimum gap between two "remote input dropped" warnings, in milliseconds.
+const val INPUT_DROP_LOG_INTERVAL_MS = 5000L
+
+/// Dedicated notification id for "remote input cannot be injected".
+const val INPUT_NOTIFY_ID = 2
+
 const val MIME_TYPE = MediaFormat.MIMETYPE_VIDEO_VP9
 
 // video const
@@ -62,6 +68,97 @@ const val VIDEO_KEY_BIT_RATE = 1024_000
 const val VIDEO_KEY_FRAME_RATE = 30
 
 class MainService : Service() {
+
+    // Throttle for the "input dropped" warning so a controller that keeps
+    // moving the mouse cannot flood logcat.
+    private var inputDropLoggedAt = 0L
+    // One "input unavailable" notice per outage; reset as soon as the
+    // accessibility service is back, so a later loss is reported again.
+    private var inputUnavailableNotified = false
+
+    /**
+     * Remote input can only be injected through the accessibility service
+     * (`InputService`). When the user never granted it - or the ROM dropped the
+     * grant after an app update / force-stop, which happens on MIUI / EMUI /
+     * ColorOS - `InputService.ctx` is null.
+     *
+     * This used to be swallowed by `?.` with no log and no feedback anywhere:
+     * the controller saw a live picture and a dead screen, and the phone said
+     * nothing. Log it (throttled) and tell the app once per outage so it can
+     * offer the one-tap way back to the system toggle.
+     */
+    private fun inputServiceOrNull(): InputService? {
+        val ctx = InputService.ctx
+        if (ctx != null) {
+            if (inputUnavailableNotified) {
+                inputUnavailableNotified = false
+                if (::notificationManager.isInitialized) {
+                    notificationManager.cancel(INPUT_NOTIFY_ID)
+                }
+            }
+            return ctx
+        }
+        val now = SystemClock.elapsedRealtime()
+        if (now - inputDropLoggedAt > INPUT_DROP_LOG_INTERVAL_MS) {
+            inputDropLoggedAt = now
+            Log.w(
+                logTag,
+                "remote input dropped: accessibility service is not enabled " +
+                    "(Settings > Accessibility > LDesk Input)"
+            )
+        }
+        if (!inputUnavailableNotified) {
+            inputUnavailableNotified = true
+            Handler(Looper.getMainLooper()).post {
+                MainActivity.flutterMethodChannel?.invokeMethod(
+                    "on_input_unavailable", emptyMap<String, String>()
+                )
+            }
+            notifyInputServiceMissing()
+        }
+        return null
+    }
+
+    /**
+     * A remote session is running, the controller keeps sending input, and we
+     * are dropping all of it. The app is almost always in the background while
+     * being controlled, so an in-app dialog would never be seen - post a
+     * dedicated notification whose tap target is the accessibility list, where
+     * "LDesk Input" can be switched back on in one tap.
+     *
+     * Uses a fresh builder on purpose: [notificationBuilder] carries the
+     * foreground-service state and must not be polluted by this one-off.
+     */
+    private fun notifyInputServiceMissing() {
+        if (!::notificationManager.isInitialized) {
+            return
+        }
+        try {
+            val intent = Intent("android.settings.ACCESSIBILITY_SETTINGS").apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            val pendingIntent = PendingIntent.getActivity(
+                this, 0, intent, FLAG_UPDATE_CURRENT or FLAG_IMMUTABLE
+            )
+            val text = translate("android_input_permission_tip1")
+            val notification = NotificationCompat
+                .Builder(this, notificationChannel)
+                .setOngoing(false)
+                .setAutoCancel(true)
+                .setSmallIcon(R.mipmap.ic_stat_logo)
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setContentTitle(DEFAULT_NOTIFY_TITLE)
+                .setContentText(text)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+                .setContentIntent(pendingIntent)
+                .setColor(ContextCompat.getColor(this, R.color.primary))
+                .setWhen(System.currentTimeMillis())
+                .build()
+            notificationManager.notify(INPUT_NOTIFY_ID, notification)
+        } catch (e: Exception) {
+            Log.e(logTag, "failed to post input-service notification: ${e.message}")
+        }
+    }
 
     @Keep
     @RequiresApi(Build.VERSION_CODES.N)
@@ -77,10 +174,10 @@ class MainService : Service() {
         } else {
             when (kind) {
                 0 -> { // touch
-                    InputService.ctx?.onTouchInput(mask, x, y)
+                    inputServiceOrNull()?.onTouchInput(mask, x, y)
                 }
                 1 -> { // mouse
-                    InputService.ctx?.onMouseInput(mask, x, y)
+                    inputServiceOrNull()?.onMouseInput(mask, x, y)
                 }
                 else -> {
                 }
@@ -91,7 +188,7 @@ class MainService : Service() {
     @Keep
     @RequiresApi(Build.VERSION_CODES.N)
     fun rustKeyEventInput(input: ByteArray) {
-        InputService.ctx?.onKeyEvent(input)
+        inputServiceOrNull()?.onKeyEvent(input)
     }
 
     @Keep

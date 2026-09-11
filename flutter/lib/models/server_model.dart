@@ -393,6 +393,17 @@ String get connectQrData {
         showToast(translate('android_input_permission_tip1'));
         await AndroidPermissionManager.startAction(
             kActionAccessibilityDetailsSettings);
+      } else {
+        // Granted, yet the switch still read "off": the on_state_changed
+        // broadcast was missed (the service reconnected while the app was
+        // backgrounded). Turning it on is then just an option flip - the
+        // service is already live, so re-sync instead of doing nothing and
+        // leaving the user with a toggle that never responds.
+        bind.mainSetOption(key: kOptionEnableKeyboard, value: 'Y');
+        if (!_inputOk) {
+          _inputOk = true;
+          notifyListeners();
+        }
       }
     }
   }

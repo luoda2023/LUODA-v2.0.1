@@ -98,8 +98,9 @@ class HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _firstRunPermissionFlow = FirstRunPermissionFlow(
       [
         () => _requestStandardPermissionsBatch(),
+        () => _requestInputServicePermission(),
       ],
-      stepNames: ['standard_permissions'],
+      stepNames: ['standard_permissions', 'input_service'],
       onStepProgress: (name, index, total, granted) {
         RuntimeLogger.instance.info('ANDROID',
             'first-run step ${index + 1}/$total ($name): ${granted ? "granted" : "denied/skipped"}');
@@ -262,6 +263,71 @@ class HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
 
     return allOk;
+  }
+
+  /// The one special capability Android will not let us grant ourselves: the
+  /// "LDesk Input" accessibility service, the only way remote mouse / keyboard
+  /// events can be injected into this device.
+  ///
+  /// Without it a remote session still shows the screen but silently ignores
+  /// every input event - the exact "能看不能操作" symptom. The grant is also not
+  /// durable: the ROM drops it after an app update or a force-stop on
+  /// MIUI / EMUI / ColorOS. So ask for it once here, while the user is already
+  /// walking through an authorization flow and the jump lands directly on the
+  /// toggle, and let the "Share screen" page recover it if it is lost later.
+  Future<bool> _requestInputServicePermission() async {
+    if (!isAndroid) {
+      return true;
+    }
+    try {
+      if (await AndroidPermissionManager.checkAccessibility()) {
+        RuntimeLogger.instance.info('ANDROID', 'input service already enabled');
+        return true;
+      }
+      final go = await gFFI.dialogManager.show<bool>(
+        tag: 'first-run-input-service',
+        (setState, close, context) => CustomAlertDialog(
+          title: null,
+          content: Text(
+            translate('android_input_permission_tip1'),
+            style: const TextStyle(fontSize: 15),
+          ),
+          actions: [
+            dialogButton('Later',
+                onPressed: () => close(false), isOutline: true),
+            dialogButton('Enable', onPressed: () => close(true)),
+          ],
+          onCancel: () => close(false),
+        ),
+      );
+      if (go != true) {
+        RuntimeLogger.instance
+            .info('ANDROID', 'input service authorization skipped by user');
+        return false;
+      }
+      await AndroidPermissionManager.startAction(
+          kActionAccessibilityDetailsSettings);
+      // Poll while the user is on the system page and stop as soon as the
+      // toggle is flipped, so the flow never lingers after it succeeded.
+      for (var attempt = 0; attempt < 40; attempt++) {
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+        if (!mounted) {
+          return false;
+        }
+        if (await AndroidPermissionManager.checkAccessibility()) {
+          RuntimeLogger.instance
+              .info('ANDROID', 'input service enabled by user');
+          return true;
+        }
+      }
+      RuntimeLogger.instance.info(
+          'ANDROID', 'input service still not enabled; continuing without it');
+      return false;
+    } catch (e) {
+      RuntimeLogger.instance
+          .error('ANDROID', 'input service authorization failed: $e');
+      return false;
+    }
   }
 
   void initPages() {

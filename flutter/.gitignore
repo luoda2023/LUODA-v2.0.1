@@ -54,3 +54,9 @@ flutter_export_environment.sh
 Flutter-Generated.xcconfig
 key.jks
 macos/luoda.xcodeproj/project.xcworkspace/
+
+# 构建期生成的本地配置（含本机绝对路径），不入库。
+# 曾被误提交一份内容停在 2.0.1/1 的 flutter/local.properties，
+# 与主项目版本号（Cargo.toml / pubspec.yaml）对不上，纯属误导 —— 且全仓库无人读它，
+# 真正被 Gradle 读的是 android/local.properties（已由 android/.gitignore 忽略）。
+local.properties

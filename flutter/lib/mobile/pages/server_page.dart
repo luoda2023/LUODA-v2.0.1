@@ -809,6 +809,13 @@ void androidChannelInit() {
             gFFI.serverModel.onProjectionCanceled();
             break;
           }
+        case "on_input_unavailable":
+          {
+            // The controlled side just dropped a remote input event because
+            // the "LDesk Input" accessibility service is not enabled.
+            showInputUnavailableNotice();
+            break;
+          }
         case "msgbox":
           {
             var type = arguments["type"] as String;
@@ -833,5 +840,61 @@ void androidChannelInit() {
     }
     return "";
   });
+}
+
+/// Guards against stacking the notice if the native side reports the outage
+/// more than once during the same session.
+bool _inputUnavailableNoticeShowing = false;
+
+/// This device cannot inject remote input: the "LDesk Input" accessibility
+/// service is off - either it was never granted, or the ROM dropped the grant
+/// after an app update / force-stop (common on MIUI / EMUI / ColorOS).
+///
+/// Android forbids third-party apps from enabling an accessibility service, so
+/// we cannot restore it for the user. What we *can* do is never fail silently:
+/// say it out loud on the controlled device and jump straight to the toggle.
+void showInputUnavailableNotice() {
+  if (_inputUnavailableNoticeShowing) {
+    return;
+  }
+  _inputUnavailableNoticeShowing = true;
+  // Reset the guard however the dialog ends - including a global dismissAll()
+  // fired by an unrelated session event, which never reaches our onCancel.
+  unawaited(
+    gFFI.dialogManager
+        .show<bool>(
+          tag: 'input-unavailable',
+          (setState, close, context) {
+            void done() {
+              close();
+            }
+
+            return CustomAlertDialog(
+              title: null,
+              content: Text(
+                translate('android_input_permission_tip1'),
+                style: const TextStyle(fontSize: 15),
+              ),
+              actions: [
+                dialogButton('Close', onPressed: done, isOutline: true),
+                dialogButton(
+                  'Enable',
+                  onPressed: () async {
+                    done();
+                    await AndroidPermissionManager.startAction(
+                        kActionAccessibilityDetailsSettings);
+                  },
+                ),
+              ],
+              onCancel: done,
+            );
+          },
+        )
+        .then((_) {}, onError: (e) {
+      debugPrint('input-unavailable notice failed: $e');
+    }).whenComplete(() {
+      _inputUnavailableNoticeShowing = false;
+    }),
+  );
 }
 
