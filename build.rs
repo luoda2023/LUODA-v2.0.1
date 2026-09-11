@@ -33,7 +33,28 @@ fn build_mac() {
     println!("cargo:rerun-if-changed={}", file);
 }
 
+/// Inject the build timestamp consumed by `src/version.rs` (`BUILD_DATE`).
+///
+/// Previously this was a literal in `src/version.rs` written by
+/// `hbb_common::gen_version()`, which nothing ever called — so it went stale the
+/// moment a release was cut from a tree where nobody remembered to edit it.
+fn build_date() {
+    println!("cargo:rerun-if-changed=build.rs");
+    let stamp = match std::env::var("SOURCE_DATE_EPOCH") {
+        // Reproducible builds: honour the epoch if the CI sets one.
+        Ok(epoch) => match epoch.parse::<i64>() {
+            Ok(secs) => chrono::DateTime::from_timestamp(secs, 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_else(|| "unknown".to_owned()),
+            Err(_) => "unknown".to_owned(),
+        },
+        Err(_) => chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
+    };
+    println!("cargo:rustc-env=LDESK_BUILD_DATE={stamp}");
+}
+
 fn main() {
+    build_date();
     #[cfg(windows)]
     build_windows();
     #[cfg(target_os = "macos")]

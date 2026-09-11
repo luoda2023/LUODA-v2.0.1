@@ -1,6 +1,6 @@
 [package]
 name = "luoda"
-version = "2.2.40"
+version = "2.2.41"
 authors = ["LUODA <https://dicad.cn>"]
 edition = "2021"
 build= "build.rs"
@@ -226,6 +226,8 @@ winapi = { version = "0.3", features = [ "winnt", "pdh", "synchapi" ] }
 [build-dependencies]
 cc = "1.0"
 os-version = "0.2"
+# build.rs injects LDESK_BUILD_DATE (see src/version.rs -> BUILD_DATE)
+chrono = "0.4"
 
 [dev-dependencies]
 hound = "3.5"

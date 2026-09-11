@@ -9,10 +9,7 @@ pub use protos::message as message_proto;
 pub use protos::rendezvous as rendezvous_proto;
 use serde_derive::{Deserialize, Serialize};
 use std::{
-    fs::File,
-    io::{self, BufRead},
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
-    path::Path,
     time::{self, SystemTime, UNIX_EPOCH},
 };
 pub use tokio;
@@ -226,34 +223,11 @@ pub fn get_version_from_url(url: &str) -> String {
     "".to_owned()
 }
 
-pub fn gen_version() {
-    println!("cargo:rerun-if-changed=Cargo.toml");
-    use std::io::prelude::*;
-    let mut file = File::create("./src/version.rs").unwrap();
-    for line in read_lines("Cargo.toml").unwrap().flatten() {
-        let ab: Vec<&str> = line.split('=').map(|x| x.trim()).collect();
-        if ab.len() == 2 && ab[0] == "version" {
-            file.write_all(format!("pub const VERSION: &str = {};\n", ab[1]).as_bytes())
-                .ok();
-            break;
-        }
-    }
-    // generate build date
-    let build_date = format!("{}", chrono::Local::now().format("%Y-%m-%d %H:%M"));
-    file.write_all(
-        format!("#[allow(dead_code)]\npub const BUILD_DATE: &str = \"{build_date}\";\n").as_bytes(),
-    )
-    .ok();
-    file.sync_all().ok();
-}
-
-fn read_lines<P>(filename: P) -> io::Result<io::Lines<io::BufReader<File>>>
-where
-    P: AsRef<Path>,
-{
-    let file = File::open(filename)?;
-    Ok(io::BufReader::new(file).lines())
-}
+// NOTE: `gen_version()` / `read_lines()` used to live here. They rewrote
+// `./src/version.rs` from `Cargo.toml`, but were never called by any build
+// script — so they could only ever add drift (the exact failure that left the
+// 2.2.40 release self-reporting 2.2.33). Version is now derived at compile time
+// in `src/version.rs` via `env!("CARGO_PKG_VERSION")`. Do not reintroduce.
 
 pub fn is_valid_custom_id(id: &str) -> bool {
     regex::Regex::new(r"^[a-zA-Z][\w-]{5,15}$")
